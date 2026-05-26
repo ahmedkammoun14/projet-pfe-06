@@ -1,9 +1,9 @@
-# 🚀  VM Migration Orchestrator v2.0
+# 🚀 VM Migration Orchestrator v2.1 (Overhaul)
 
 ## 📝 Description
-The **VM Migration Orchestrator v2.0** is an advanced autonomous decision-making system designed for real-time streaming services. Built on a strict **Hub-and-Spoke architecture**, it leverages predictive Machine Learning models (**GRU, RNN, LSTM**) and Large Language Models (**Ollama qwen2.5**) to ensure high Quality of Service (QoS) through proactive service migration.
+The **VM Migration Orchestrator v2.1** is an advanced autonomous decision-making system designed for real-time streaming services. Built on a strict **Hub-and-Spoke architecture**, it leverages predictive Machine Learning models (**GRU, RNN, LSTM**) and Large Language Models (**Ollama qwen2.5**) to ensure high Quality of Service (QoS) through proactive service migration.
 
-The system continuously monitors Virtual Machine (VM) performance and triggers migrations based on Service Level Objectives (SLOs) extracted from natural language user intentions.
+This version features a complete overhaul of the core logic, introducing a **Multi-Criteria Predictive Engine**, a **Cooldown Mechanism**, and a **Full Simulation Ecosystem**.
 
 ---
 
@@ -26,19 +26,20 @@ The project follows a modular **Hub-and-Spoke** design where a central **Hub (Co
 | **HistoryLoader** | `8021` | Historical data window extraction for ML and Analysis. |
 | **MetricsManager** | `8022` | Dependency analysis for SLO metrics. |
 
-### Data Flow Diagram (ASCII)
-```text
-[ User / Intent ]        [ Picar / RTT ]
-       |                       |
-       v                       v
-[ IntentManager ]       [ LatencyManager ]
-       |                       |
-       +-------[ CORE ]--------+
-                 |
-    +------------+------------+------------+
-    |            |            |            |
-[  ML  ]    [ Decision ]    [  DB  ]    [ MASTER ]
-```
+---
+
+## 🛠️ Simulation Ecosystem
+
+To facilitate testing and demonstration, two simulation scripts are provided:
+
+### 1. VM Simulator (`vm_simulator.py`)
+Simulates 4 distinct Virtual Machines (`vm1` to `vm4`) running on ports `8101` to `8104`.
+- **Endpoints**: `/health` (returns RTT) and `/metrics` (returns CPU/RAM).
+- **Behavior**: Each VM has a unique profile (e.g., `vm2` is intentionally "heavy" to trigger migrations).
+
+### 2. PiCar Simulator (`picar_simulator.py`)
+Acts as a mobile sensor reporter (e.g., a car moving through the network).
+- **Action**: Polls all 4 VMs every 5 seconds and reports the measurements to the Orchestrator's **LatencyManager** (`:8010`).
 
 ---
 
@@ -54,8 +55,8 @@ The project follows a modular **Hub-and-Spoke** design where a central **Hub (Co
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/ahmedkammoun14/simulation-with-arch-hub-v0
-   cd simulation-with-arch-hub-v0
+   git clone https://github.com/ahmedkammoun14/simulation-with-arch-hub-v1-26-05-2026.git
+   cd simulation-with-arch-hub-v1-26-05-2026
    ```
 
 2. **Install dependencies**:
@@ -79,13 +80,9 @@ The orchestrator requires three distinct ML API instances:
 - **Terminal 2 (CPU)**: `uvicorn app.auto:auto_app --port 5002`
 - **Terminal 3 (RAM)**: `uvicorn app.auto:auto_app --port 5003`
 
-### 2. Train Models (Initial Setup Only)
-Initialize and train the models with historical datasets:
-```bash
-curl -X GET "http://localhost:5001/train?file_name=node1_delay.csv"
-curl -X GET "http://localhost:5002/train?file_name=node1_cpu.csv"
-curl -X GET "http://localhost:5003/train?file_name=node1_ram.csv"
-```
+### 2. Launch the Simulation Infrastructure (2 separate terminals)
+- **Terminal 4 (VMs)**: `python vm_simulator.py`
+- **Terminal 5 (PiCar)**: `python picar_simulator.py`
 
 ### 3. Start the Orchestrator
 ```bash
@@ -94,15 +91,12 @@ python orchestrator.py
 
 ---
 
-## 🔄 Usage Modes
+## 🔄 New Features (v2.1)
 
-### Classic Mode (Default)
-Starts automatically in simulation mode. It generates random RTT values every 5 seconds until real data is received via the API.
-- **Trigger**: Migration occurs if `RTT > 50ms`.
-
-### Enhanced Mode (LLM-Activated)
-Activated automatically when a natural language intention is sent to the system. It enables full observability (CPU/RAM/RTT).
-- **Trigger**: Migration occurs if any **AI-defined SLO** is violated.
+- **Predictive Multi-Criteria Decision**: Migrations are now decided based on a weighted analysis of predicted RTT, CPU, and RAM usage.
+- **Migration Cooldown**: A 60-second cooldown is enforced between migrations to prevent "flapping" (unstable oscillation between nodes).
+- **Visual Logs**: A video demo of the system in action is available at `logs_mode_classic.webm`.
+- **Robust Testing**: Comprehensive test suite in `test_orchestrator.py` covering core logic and integration.
 
 ---
 
@@ -120,64 +114,26 @@ Activated automatically when a natural language intention is sent to the system.
 
 ## ⌨️ Request Examples (PowerShell)
 
-**1. Send Real RTT Measurements**:
-```powershell
-$body = @{
-    source = "picar"
-    measurements = @(
-        @{vm_id="vm1"; rtt_ms=12.3},
-        @{vm_id="vm2"; rtt_ms=45.2},
-        @{vm_id="vm3"; rtt_ms=8.9},
-        @{vm_id="vm4"; rtt_ms=27.6}
-    )
-} | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri "http://localhost:8010/rtt" -Body $body -ContentType "application/json"
-```
-
-**2. Send Intent to LLM**:
+**1. Send Intent to LLM**:
 ```powershell
 $body = @{ intention = "Keep latency below 20ms and CPU below 60%" } | ConvertTo-Json
 Invoke-RestMethod -Method Post -Uri "http://localhost:8014/intent" -Body $body -ContentType "application/json"
 ```
 
-**3. Check Core Status**:
+**2. Check Core Status**:
 ```powershell
 Invoke-RestMethod -Method Get -Uri "http://localhost:8000/status"
 ```
 
 ---
 
-## ⚡ Execution Flows
-
-### Classic Flow (7 Steps)
-1. **Store**: Core stores received RTTs in the Database.
-2. **Load**: Core requests history from the HistoryLoader.
-3. **Request**: Core sends data to the MLPredictor.
-4. **Return**: MLPredictor returns RTT predictions to the Core.
-5. **Analyze**: Core requests a decision from DecisionIntelligence.
-6. **Return**: DecisionIntelligence returns `migrate` or `stay`.
-7. **Command**: Core sends the migration command to the Master Cloud.
-
-### Enhanced Flow (9 Steps)
-1. **Analyze**: Core asks MetricsManager to analyze LLM-extracted SLOs.
-2. **Request**: MetricsManager asks Collector to gather physical metrics.
-3. **Store**: Collector stores CPU/RAM metrics in the Database.
-4. **Load**: Core retrieves the full history context (RTT+CPU+RAM).
-5. **Request**: Core sends the full context to the MLPredictor.
-6. **Return**: MLPredictor returns multi-variable predictions.
-7. **Analyze**: Core requests a decision based on strict SLO thresholds.
-8. **Return**: DecisionIntelligence returns the final migration decision.
-9. **Command**: Core sends the migration command to the Master Cloud.
-
----
-
 ## 📁 Project Structure
 - `orchestrator.py`: The main Hub-and-Spoke script (600+ lines).
+- `vm_simulator.py`: Simulator for 4 VMs with REST health/metrics endpoints.
+- `picar_simulator.py`: Reporter script simulating a mobile sensor.
 - `test_orchestrator.py`: Robust test suite (12+ Unit and Integration tests).
-- `requirements.txt`: Project dependencies.
 - `intent_engine/`: Module for Ollama LLM communication.
 - `models/`: Pydantic data schemas.
-- `QoS_Pred_API_V2/`: Machine Learning API source code.
 - `orchestrator.db`: Auto-managed SQLite database.
 
 ---
@@ -186,6 +142,7 @@ Invoke-RestMethod -Method Get -Uri "http://localhost:8000/status"
 | Component | Technology |
 | :--- | :--- |
 | **Orchestrator** | Python 3.12 / Flask |
+| **Simulators** | FastAPI / Uvicorn / Httpx |
 | **LLM** | Ollama (qwen2.5) |
 | **ML Latency** | GRU (Gated Recurrent Unit) |
 | **ML CPU** | RNN (Recurrent Neural Network) |
@@ -194,5 +151,3 @@ Invoke-RestMethod -Method Get -Uri "http://localhost:8000/status"
 | **Visualisation** | Matplotlib (Real-time dashboard) |
 | **Terminal UI** | Colorama (Color-coded logging) |
 | **Testing** | Pytest |
-
-
