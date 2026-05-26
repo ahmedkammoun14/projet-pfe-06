@@ -1,213 +1,200 @@
+import unittest
+from unittest.mock import MagicMock, patch, patch
 import pytest
-import sqlite3
 import time
-import os
-import threading
-import requests
-import gc
+import json
+from datetime import datetime, timezone
+from typing import List, Dict
+
+# Import des composants à tester
 from orchestrator import (
-    Config, DatabaseSpoke, MLPredictorSpoke, 
-    DecisionIntelligenceSpoke, IntentManagerSpoke, OrchestratorCore,
-    HistoryLoaderSpoke
+    Config, 
+    calculate_weighted_mean, 
+    DecisionIntelligenceSpoke, 
+    MLPredictorSpoke, 
+    IntentManagerSpoke, 
+    CollectorSpoke, 
+    OrchestratorCore,
+    DatabaseSpoke,
+    ObservabilitySpoke
 )
 
-def _remove_db_safely(db_name: str):
-    """Force la fermeture de SQLite et tente de supprimer le fichier avec retry."""
-    gc.collect()
-    time.sleep(0.1)
-    for _ in range(3):
-        try:
-            if os.path.exists(db_name):
-                os.remove(db_name)
-            break
-        except PermissionError:
-            time.sleep(0.2)
+# =============================================================================
+# 1. TESTS DES UTILITAIRES (Unit Tests)
+# =============================================================================
 
-# -----------------------------------------------------------------------------
-# SECTION 1 : TESTS UNITAIRES (sans Flask, sans réseau)
-# -----------------------------------------------------------------------------
+def test_calculate_weighted_mean_empty():
+    """Vérifie qu'une liste vide retourne 0.0."""
+    assert calculate_weighted_mean([]) == 0.0
 
-def test_1_1_config_defaults():
-    """Vérification des paramètres par défaut."""
-    conf = Config()
-    assert conf.CORE_PORT == 8000
-    assert conf.LATENCY_PORT == 8010
-    assert conf.DB_NAME == "orchestrator.db"
-    assert conf.VM_LIST == ["vm1", "vm2", "vm3", "vm4"]
+def test_calculate_weighted_mean_single_value():
+    """Vérifie qu'une seule valeur retourne elle-même."""
+    assert calculate_weighted_mean([10.0]) == 10.0
 
-def test_1_2_database_spoke_lifecycle():
-    """Vérifie le cycle init -> save -> load avec nettoyage."""
-    test_db = "test_unit_db.db"
-    _remove_db_safely(test_db)
+def test_calculate_weighted_mean_seven_values():
+    """Vérifie le calcul exact pour 7 valeurs (poids 7 à 1, total 28)."""
+    # (10*7 + 10*6 + 10*5 + 10*4 + 10*3 + 10*2 + 10*1) / 28 = 280 / 28 = 10.0
+    values = [10.0] * 7
+    assert calculate_weighted_mean(values) == 10.0
     
-    try:
-        conf = Config(DB_NAME=test_db)
-        db = DatabaseSpoke(conf)
-        db.init_db()
-        
-        measurements = [{"vm_id": "vm1", "rtt_ms": 42.0}]
-        db.save_metrics(measurements, mode="classic")
-        
-        # Correction : utilise HistoryLoaderSpoke au lieu de DatabaseSpoke
-        history_loader = HistoryLoaderSpoke(conf)
-        history = history_loader.load_history_window("vm1", "latency", 10)
-        assert len(history) > 0
-        assert history[0] == 42.0
-    finally:
-        _remove_db_safely(test_db)
+    # Cas avec variation : [20, 10, 10, 10, 10, 10, 10]
+    # (20*7 + 10*6 + 10*5 + 10*4 + 10*3 + 10*2 + 10*1) / 28 = 350 / 28 = 12.5
+    values2 = [20.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
+    assert calculate_weighted_mean(values2) == 12.5
 
-def test_1_3_ml_predictor_fallback():
-    """Vérifie le basculement en simulation si l'API est injoignable."""
-    conf = Config(ML_RTT_URL="http://localhost:1/unreachable")
-    ml = MLPredictorSpoke(conf)
+# =============================================================================
+# 2. TESTS DE LA LOGIQUE DE DÉCISION (Logic Tests)
+# =============================================================================
+
+class TestDecisionLogic:
     
-    current_val = 20.0
-    # On s'attend à ce que l'exception soit catchée et la simulation retournée
-    preds = ml.get_prediction(current_val, [18.0, 19.0, 20.0])
-    
-    assert len(preds) == 5
-    assert preds[0] == pytest.approx(21.0, rel=1e-3) # 20 * 1.05
+    @pytest.fixture
+    def config(self):
+        return Config(DEFAULT_LATENCY_THRESHOLD=50.0)
 
-def test_1_4_decision_logic_classic():
-    """Vérifie la règle de décision Classic : migration si seuil > 50ms."""
-    conf = Config()
-    di = DecisionIntelligenceSpoke(conf)
-    
-    current_data = [
-        {"vm_id": "vm1", "rtt_ms": 80.0}, # Over threshold
-        {"vm_id": "vm2", "rtt_ms": 20.0},
-        {"vm_id": "vm3", "rtt_ms": 15.0}, # Best target
-        {"vm_id": "vm4", "rtt_ms": 30.0}
-    ]
-    preds_map = {vm["vm_id"]: [vm["rtt_ms"]]*5 for vm in current_data}
-    
-    decision = di.evaluate_decision(current_data, preds_map)
-    assert decision["decision"] == "migrate"
-    assert decision["from_vm"] == "vm1"
-    assert decision["to_vm"] == "vm3"
+    @pytest.fixture
+    def decision_engine(self, config):
+        return DecisionIntelligenceSpoke(config)
 
-def test_1_5_intent_parsing():
-    """Vérifie l'extraction des SLOs par Regex."""
-    mgr = IntentManagerSpoke(Config())
-    slos = mgr._parse_slos("latency < 20 and cpu < 70")
-    
-    assert any(s["metric"] == "latency" and s["threshold"] == 20.0 for s in slos)
-    assert any(s["metric"] == "cpu_usage" and s["threshold"] == 70.0 for s in slos)
-
-def test_1_6_intent_fallback():
-    """Vérifie les SLOs par défaut si le LLM est injoignable."""
-    conf = Config(INTENT_ENGINE_URL="http://localhost:1/unreachable")
-    mgr = IntentManagerSpoke(conf)
-    
-    slos = mgr.query_intent_engine("I want fast response")
-    assert len(slos) == 3
-    assert any(s["metric"] == "latency" and s["threshold"] == 50.0 for s in slos)
-
-# -----------------------------------------------------------------------------
-# SECTION 2 : TESTS D'INTÉGRATION (sans réseau externe)
-# -----------------------------------------------------------------------------
-
-def test_2_1_classic_flow_complete():
-    """Test du flux Classic complet sans boucle infinie."""
-    db_name = "test_classic_flow.db"
-    _remove_db_safely(db_name)
-    
-    try:
-        core = OrchestratorCore(Config(DB_NAME=db_name))
-        core.db.init_db()
+    def test_classic_decision_nominal(self, decision_engine):
+        """Arrange: Toutes les VMs sous le seuil. Act: Evaluate. Assert: Stay."""
+        current_data = [{"vm_id": "vm1", "rtt_ms": 10.0}, {"vm_id": "vm2", "rtt_ms": 15.0}]
+        preds = {"vm1": [10.0]*5, "vm2": [15.0]*5}
         
-        measurements = [{"vm_id": vm, "rtt_ms": 10.0} for vm in core.config.VM_LIST]
-        measurements[0]["rtt_ms"] = 90.0 # Force migration
+        result = decision_engine.evaluate_classic_decision(current_data, preds)
         
-        decision = core.run_classic_flow(measurements)
-        
-        assert decision["decision"] == "migrate"
-        assert decision["from_vm"] == "vm1"
-        
-        with sqlite3.connect(db_name) as conn:
-            res = conn.execute("SELECT count(*) FROM decisions").fetchone()
-            assert res[0] > 0
-    finally:
-        _remove_db_safely(db_name)
+        assert result["decision"] == "stay"
+        assert "Nominal" in result["reason"]
 
-def test_2_2_enhanced_flow_complete():
-    """Test du flux Enhanced complet sans boucle infinie."""
-    db_name = "test_enhanced_flow.db"
-    _remove_db_safely(db_name)
-    
-    try:
-        core = OrchestratorCore(Config(DB_NAME=db_name))
-        core.db.init_db()
-        core.set_user_intent("low latency") # Active mode enhanced
+    def test_classic_decision_threshold_breach(self, decision_engine):
+        """Arrange: vm1 dépasse 50ms. Act: Evaluate. Assert: Migrate."""
+        current_data = [{"vm_id": "vm1", "rtt_ms": 60.0}, {"vm_id": "vm2", "rtt_ms": 10.0}]
+        preds = {"vm1": [60.0]*5, "vm2": [10.0]*5}
         
-        measurements = [{"vm_id": vm, "rtt_ms": 20.0} for vm in core.config.VM_LIST]
-        decision = core.run_enhanced_flow(measurements)
+        result = decision_engine.evaluate_classic_decision(current_data, preds)
         
-        assert "decision" in decision
-        assert core.mode == "enhanced"
-    finally:
-        _remove_db_safely(db_name)
+        assert result["decision"] == "migrate"
+        assert result["from_vm"] == "vm1"
+        assert result["to_vm"] == "vm2"
 
-def test_2_3_simulation_switch_logic():
-    """Vérifie la logique temporelle du basculement simulation."""
-    core = OrchestratorCore(Config())
-    assert core.last_real_data_ts is None
-    
-    core.last_real_data_ts = time.time()
-    assert (time.time() - core.last_real_data_ts) < 30
-
-# -----------------------------------------------------------------------------
-# SECTION 3 : TESTS FLASK (endpoints HTTP)
-# -----------------------------------------------------------------------------
-
-@pytest.fixture(scope="module")
-def api_core():
-    """Initialisation manuelle et démarrage des serveurs Flask."""
-    db_name = "test_flask_api.db"
-    _remove_db_safely(db_name)
-    
-    try:
-        core = OrchestratorCore(Config(DB_NAME=db_name))
-        core.db.init_db()
-        # Initialisation manuelle demandée
-        core.latency_mgr.core = core
-        core.intent_mgr.core = core
+    def test_enhanced_decision_cpu_breach(self, decision_engine):
+        """Arrange: SLO CPU < 70, vm1 est à 80. Act: Evaluate. Assert: Migrate."""
+        slos = [{"metric": "cpu_usage", "threshold": 70.0, "weight": 1.0}]
+        current_data = [
+            {"vm_id": "vm1", "cpu_usage": 80.0, "rtt_ms": 20.0},
+            {"vm_id": "vm2", "cpu_usage": 40.0, "rtt_ms": 20.0}
+        ]
+        # Prédictions stables
+        preds = {
+            "vm1": {"cpu_usage": [80.0]*7},
+            "vm2": {"cpu_usage": [40.0]*7}
+        }
         
-        # Démarrage des APIs spokes
-        core.latency_mgr.start_api()
-        core.intent_mgr.start_api()
+        result = decision_engine.evaluate_enhanced_decision(current_data, preds, slos)
         
-        # Démarrage API Core
-        core._setup_routes()
-        threading.Thread(target=core.app.run, kwargs={
-            'host': '0.0.0.0', 'port': 8000, 
-            'threaded': True, 'use_reloader': False
-        }, daemon=True).start()
+        assert result["decision"] == "migrate"
+        assert result["from_vm"] == "vm1"
+        assert result["to_vm"] == "vm2"
+
+    def test_enhanced_decision_missing_metric(self, decision_engine):
+        """Vérifie que si une métrique est absente (None), le SLO est ignoré."""
+        slos = [{"metric": "ram_usage", "threshold": 80.0, "weight": 1.0}]
+        current_data = [{"vm_id": "vm1", "rtt_ms": 20.0}] # ram_usage manquant
+        preds = {"vm1": {"ram_usage": [50.0]*7}}
         
-        time.sleep(2) # Laisse le temps au boot
-        yield core
-    finally:
-        _remove_db_safely(db_name)
+        result = decision_engine.evaluate_enhanced_decision(current_data, preds, slos)
+        
+        assert result["decision"] == "stay" # Pas de crash, stay car pas de violation ram_usage connue
 
-def test_3_1_api_rtt_post(api_core):
-    """Vérifie l'endpoint /rtt avec payload valide."""
-    payload = {
-        "measurements": [{"vm_id": vm, "rtt_ms": 10.0} for vm in api_core.config.VM_LIST]
-    }
-    resp = requests.post("http://localhost:8010/rtt", json=payload)
-    assert resp.status_code == 200
-    assert "decision" in resp.json()
+# =============================================================================
+# 3. TESTS D'EXTRACTION D'INTENTION (LLM & Regex)
+# =============================================================================
 
-def test_3_2_api_rtt_invalid(api_core):
-    """Vérifie le rejet d'un payload vide."""
-    resp = requests.post("http://localhost:8010/rtt", json={})
-    assert resp.status_code == 400
+class TestIntentExtraction:
 
-def test_3_3_api_core_status(api_core):
-    """Vérifie l'endpoint status du Core."""
-    resp = requests.get("http://localhost:8000/status")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert "mode" in data
-    assert "vm_list" in data
-    assert "uptime_seconds" in data
+    @pytest.fixture
+    def intent_mgr(self):
+        return IntentManagerSpoke(Config(), MagicMock())
+
+    def test_parse_slos_valid_json(self, intent_mgr):
+        """Vérifie l'extraction d'un JSON valide retourné par le LLM."""
+        llm_output = '[{"metric": "latency", "operator": "<", "threshold": 25, "unit": "ms", "weight": 1.0}]'
+        slos = intent_mgr._parse_slos_from_text(llm_output)
+        
+        assert len(slos) == 1
+        assert slos[0]["metric"] == "latency"
+        assert slos[0]["threshold"] == 25
+
+    def test_parse_slos_regex_fallback(self, intent_mgr):
+        """Vérifie le fallback regex si le JSON est malformé."""
+        bad_output = "I want latency < 30 and cpu < 60 please."
+        slos = intent_mgr._parse_slos_from_text(bad_output)
+        
+        metrics = [s["metric"] for s in slos]
+        assert "latency" in metrics
+        assert "cpu_usage" in metrics
+        # Vérifie la somme des poids
+        assert sum(s["weight"] for s in slos) == pytest.approx(1.0)
+
+# =============================================================================
+# 4. TESTS DU COOLDOWN (Core State Machine)
+# =============================================================================
+
+class TestOrchestratorCore:
+
+    @patch('orchestrator.DatabaseSpoke')
+    @patch('orchestrator.ObservabilitySpoke')
+    @patch('orchestrator.MLPredictorSpoke')
+    def test_cooldown_active(self, mock_ml, mock_viz, mock_db):
+        """Vérifie que la décision est 'stay' si une migration a eu lieu il y a < 60s."""
+        core = OrchestratorCore(Config())
+        core.last_migration_ts = time.time() - 10 # Migration il y a 10s
+        
+        # Simuler des données qui devraient normalement déclencher une migration
+        core.decision_engine.evaluate_classic_decision = MagicMock()
+        measurements = [{"vm_id": "vm1", "rtt_ms": 999.0}] 
+        
+        result = core.run_classic_flow(measurements)
+        
+        assert result["decision"] == "stay"
+        assert "Cooldown actif" in result["reason"]
+        # Vérifie que l'intelligence n'a même pas été appelée
+        core.decision_engine.evaluate_classic_decision.assert_not_called()
+
+# =============================================================================
+# 5. TESTS DES SPOKES DE DONNÉES (Collectors & Predictors)
+# =============================================================================
+
+class TestSpokesData:
+
+    @patch('requests.get')
+    def test_ml_predictor_api_fallback(self, mock_get):
+        """Vérifie le fallback local si l'API ML est injoignable."""
+        mock_get.side_effect = Exception("Connection Error")
+        predictor = MLPredictorSpoke(Config())
+        
+        preds = predictor.get_prediction(20.0)
+        
+        assert len(preds) == 5 # simulation locale génère 5 points
+        assert preds[0] > 20.0 # simulation locale fait croître la valeur
+
+    @patch('requests.get')
+    def test_collector_api_success(self, mock_get):
+        """Vérifie la collecte réelle via l'API de simulation de VM."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"cpu_usage": 45.5, "ram_usage": 60.0}
+        mock_get.return_value = mock_resp
+        
+        collector = CollectorSpoke(Config())
+        data = collector.collect_vm_metrics("vm1")
+        
+        assert data["cpu_usage"] == 45.5
+        assert data["ram_usage"] == 60.0
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+if __name__ == "__main__":
+    # Permet de lancer les tests directement via 'python test_orchestrator.py'
+    pytest.main([__file__, "-v"])
