@@ -5,12 +5,14 @@ import json
 import logging
 import random
 import re
+import socket
 import sqlite3
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Protocol, Union
 
 import colorama
 import matplotlib.pyplot as plt
@@ -108,6 +110,20 @@ def safe_call(default_val: Any, context_name: str):
         return wrapper
     return decorator
 
+class LatencyHandler(Protocol):
+    """Interface exposée au LatencyManagerSpoke."""
+    @property
+    def mode(self) -> str: ...
+    def run_classic_flow(self, measurements: List[Dict]) -> Dict: ...
+    def run_enhanced_flow(self, measurements: List[Dict]) -> Dict: ...
+    def set_last_real_data_ts(self, ts: float) -> None: ...
+
+class IntentHandler(Protocol):
+    """Interface exposée au IntentManagerSpoke."""
+    def set_user_intent(self, text: str) -> None: ...
+    @property
+    def current_slos(self) -> List[Dict]: ...
+
 # --- CONFIGURATION ---
 
 @dataclass
@@ -158,7 +174,7 @@ class Config:
 
 class LatencyManagerSpoke:
     """Handles real-time RTT data reception from external sensors."""
-    def __init__(self, config: Config, core: 'OrchestratorCore'):
+    def __init__(self, config: Config, core: LatencyHandler):
         self.config = config
         self.core = core
         self.app = Flask(f"{__name__}_latency")
@@ -171,7 +187,7 @@ class LatencyManagerSpoke:
             if not data or "measurements" not in data:
                 return jsonify({"error": "Invalid payload"}), 400
             
-            self.core.last_real_data_ts = time.time()
+            self.core.set_last_real_data_ts(time.time())
             measurements = data["measurements"]
             
             # Route to correct flow based on mode
@@ -192,7 +208,7 @@ class LatencyManagerSpoke:
 
 class IntentManagerSpoke:
     """Interfaces with LLM to extract SLOs from natural language."""
-    def __init__(self, config: Config, core: 'OrchestratorCore'):
+    def __init__(self, config: Config, core: IntentHandler):
         self.config = config
         self.core = core
         self.app = Flask(f"{__name__}_intent")
@@ -220,7 +236,7 @@ class IntentManagerSpoke:
         ).start()
         logger.info(f"[IntentManager] API started on port {self.config.INTENT_PORT}")
 
-    def query_intent_engine(self, text: str) -> List[Dict]:
+    def query_intent_engine(self, text: str) -> tuple[List[Dict], bool]:
         """Queries Ollama LLM to parse SLOs from user text."""
         try:
             payload = {
@@ -249,7 +265,7 @@ class IntentManagerSpoke:
             logger.warning(f"[Intent] LLM Error: {e}. Falling back to regex.")
             return self._parse_slos_from_text(text)
 
-    def _parse_slos_from_text(self, text: str) -> List[Dict]:
+    def _parse_slos_from_text(self, text: str) -> tuple[List[Dict], bool]:
         """Parses JSON or uses regex fallback to extract SLO objects."""
         # JSON parsing
         try:
@@ -257,7 +273,7 @@ class IntentManagerSpoke:
             if start != -1 and end != -1:
                 slos = json.loads(text[start:end+1])
                 if isinstance(slos, list) and slos:
-                    return slos
+                    return slos, True
         except (ValueError, json.JSONDecodeError):
             pass
 
@@ -278,14 +294,14 @@ class IntentManagerSpoke:
             w = round(1.0 / len(slos), 2)
             for s in slos: s["weight"] = w
             slos[-1]["weight"] = round(1.0 - sum(s["weight"] for s in slos[:-1]), 2)
-            return slos
+            return slos, True
 
         # Absolute Fallback
         return [
             {"metric": "latency", "operator": "<", "threshold": 50, "unit": "ms", "weight": 0.34},
             {"metric": "cpu_usage", "operator": "<", "threshold": 75, "unit": "%", "weight": 0.33},
             {"metric": "ram_usage", "operator": "<", "threshold": 80, "unit": "%", "weight": 0.33}
-        ]
+        ], False
 
 class MetricsManagerSpoke:
     """Determines which physical metrics are needed based on active SLOs."""
@@ -353,32 +369,57 @@ class DecisionIntelligenceSpoke:
     def __init__(self, config: Config):
         self.config = config
 
-    def evaluate_classic_decision(self, current_data: List[Dict], predictions_map: Dict[str, List[float]]) -> Dict:
+    def evaluate_classic_decision(self, current_data: List[Dict], predictions_map: Dict[str, List[float]], service_vm=None) -> Dict:
         """Threshold-based decision for RTT only."""
         threshold = self.config.DEFAULT_LATENCY_THRESHOLD
-        breached_vm = None
-        trigger_val = 0.0
         
-        for entry in current_data:
-            vm_id = entry["vm_id"]
-            preds = predictions_map.get(vm_id, [])
-            if entry["rtt_ms"] > threshold or calculate_weighted_mean(preds) > threshold:
-                breached_vm, trigger_val = vm_id, entry["rtt_ms"]
-                break
-                
-        if breached_vm:
-            targets = [e for e in current_data if e["vm_id"] != breached_vm]
+        if service_vm is None:
+            breached_vm = None
+            trigger_val = 0.0
+            for entry in current_data:
+                vm_id = entry["vm_id"]
+                preds = predictions_map.get(vm_id, [])
+                if entry["rtt_ms"] > threshold or calculate_weighted_mean(preds) > threshold:
+                    breached_vm, trigger_val = vm_id, entry["rtt_ms"]
+                    break
+            if breached_vm:
+                targets = [e for e in current_data if e["vm_id"] != breached_vm]
+                best = min(targets, key=lambda x: x["rtt_ms"])
+                reason = f"{breached_vm} RTT {trigger_val:.1f}ms > {threshold}ms"
+                return {"decision": "migrate", "from_vm": breached_vm, "to_vm": best["vm_id"], "reason": reason}
+            return {"decision": "stay", "reason": "Nominal"}
+
+        entry = next((e for e in current_data if e["vm_id"] == service_vm), None)
+        if not entry:
+            return {"decision": "stay", "reason": "Service VM non trouvée dans ce cycle"}
+        
+        preds = predictions_map.get(service_vm, [])
+        if entry["rtt_ms"] > threshold or calculate_weighted_mean(preds) > threshold:
+            targets = [e for e in current_data if e["vm_id"] != service_vm]
+            if not targets:
+                return {"decision": "stay", "reason": "Aucune cible disponible"}
             best = min(targets, key=lambda x: x["rtt_ms"])
-            reason = f"{breached_vm} RTT {trigger_val:.1f}ms > {threshold}ms"
-            return {"decision": "migrate", "from_vm": breached_vm, "to_vm": best["vm_id"], "reason": reason}
+            reason = f"{service_vm} RTT {entry['rtt_ms']:.1f}ms > {threshold}ms"
+            return {"decision": "migrate", "from_vm": service_vm, "to_vm": best["vm_id"], "reason": reason}
         return {"decision": "stay", "reason": "Nominal"}
 
-    def evaluate_enhanced_decision(self, current_data: List[Dict], predictions_map: Dict[str, Dict[str, List[float]]], slos: List[Dict]) -> Dict:
-        """Intention-based decision using multi-criteria weighted scoring."""
+    def evaluate_enhanced_decision(self, current_data: List[Dict], predictions_map: Dict[str, Dict[str, List[float]]], slos: List[Dict], service_vm=None) -> Dict:
+        """Intention-based decision using multi-criteria weighted scoring with severity prioritization."""
         weights = {m: 0.0 for m in ["latency", "cpu_usage", "ram_usage"]}
         for s in slos: weights[s["metric"]] = s.get("weight", 0.0)
 
-        for entry in current_data:
+        # Phase 1: Collect all violations with their severity
+        violations = []
+        
+        # Filtre current_data pour n'évaluer que service_vm
+        eval_data = current_data
+        if service_vm:
+            service_entry = next((e for e in current_data if e["vm_id"] == service_vm), None)
+            if not service_entry:
+                return {"decision": "stay", "reason": "Service VM non trouvée"}
+            eval_data = [service_entry]
+
+        for entry in eval_data:
             vm_id = entry["vm_id"]
             for slo in slos:
                 m_name, threshold = slo["metric"], slo["threshold"]
@@ -388,22 +429,37 @@ class DecisionIntelligenceSpoke:
                 
                 preds = predictions_map.get(vm_id, {}).get(m_name, [])
                 if val > threshold or calculate_weighted_mean(preds) > threshold:
-                    # Filter valid targets
-                    targets = [e for e in current_data if e["vm_id"] != vm_id]
-                    valid = [t for t in targets if all(
-                        t.get("rtt_ms" if s["metric"] == "latency" else s["metric"], 999) <= s["threshold"] 
-                        for s in slos
-                    )]
-                    
-                    final_pool = valid if valid else targets
-                    best = min(final_pool, key=lambda t: (
-                        weights["latency"] * calculate_weighted_mean(predictions_map.get(t["vm_id"], {}).get("latency", [])) +
-                        weights["cpu_usage"] * calculate_weighted_mean(predictions_map.get(t["vm_id"], {}).get("cpu_usage", [])) +
-                        weights["ram_usage"] * calculate_weighted_mean(predictions_map.get(t["vm_id"], {}).get("ram_usage", []))
-                    ))
-                    
-                    reason = f"{vm_id} {m_name} {val:.1f} > SLO {threshold}"
-                    return {"decision": "migrate", "from_vm": vm_id, "to_vm": best["vm_id"], "reason": reason}
+                    severity = (val - threshold) / threshold if threshold > 0 else val
+                    violations.append({
+                        "vm_id": vm_id,
+                        "metric": m_name,
+                        "val": val,
+                        "threshold": threshold,
+                        "severity": severity
+                    })
+
+        # Phase 2: Process the most severe violation first
+        if violations:
+            worst = max(violations, key=lambda x: x["severity"])
+            worst_vm = worst["vm_id"]
+            
+            # Filter valid targets
+            targets = [e for e in current_data if e["vm_id"] != worst_vm]
+            valid = [t for t in targets if all(
+                t.get("rtt_ms" if s["metric"] == "latency" else s["metric"], 999) <= s["threshold"] 
+                for s in slos
+            )]
+            
+            final_pool = valid if valid else targets
+            best = min(final_pool, key=lambda t: (
+                weights["latency"] * calculate_weighted_mean(predictions_map.get(t["vm_id"], {}).get("latency", [])) +
+                weights["cpu_usage"] * calculate_weighted_mean(predictions_map.get(t["vm_id"], {}).get("cpu_usage", [])) +
+                weights["ram_usage"] * calculate_weighted_mean(predictions_map.get(t["vm_id"], {}).get("ram_usage", []))
+            ))
+            
+            reason = f"{worst_vm} {worst['metric']} {worst['val']:.1f} > SLO {worst['threshold']} (Sévérité: {worst['severity']:.2f})"
+            return {"decision": "migrate", "from_vm": worst_vm, "to_vm": best["vm_id"], "reason": reason}
+
         return {"decision": "stay", "reason": "All SLOs satisfied"}
 
 class DatabaseSpoke:
@@ -449,6 +505,15 @@ class ObservabilitySpoke:
         self.predictions_history = {m: {vm: [] for vm in config.VM_LIST} for m in ["rtt", "cpu", "ram"]}
         self.current_slos = []
         self.max_points = 50
+        self.current_service_vm = None  # VM qui héberge le service
+        self.last_decision = {"decision": "stay", "reason": ""}
+
+    def update_decision(self, dec: Dict, current_vm: str = None):
+        self.last_decision = dec
+        if dec["decision"] == "migrate":
+            self.current_service_vm = dec["to_vm"]
+        elif current_vm and self.current_service_vm is None:
+            self.current_service_vm = current_vm
 
     def update_data(self, current_data: List[Dict]):
         for entry in current_data:
@@ -488,7 +553,31 @@ class ObservabilitySpoke:
                     for slo in self.current_slos:
                         if slo["metric"] == m_name:
                             ax.axhline(y=slo["threshold"], color='orange', linestyle='--', label=f'SLO {slo["threshold"]}')
-                    ax.set_title(f"{m_key.upper()} {vm}"); ax.set_ylim(0, 100); ax.legend(loc="upper right")
+                    
+                    if vm == self.current_service_vm and m_key == "rtt":
+                        ax.set_title(f"{m_key.upper()} {vm} 🟢 SERVICE", 
+                                     color="green", fontweight="bold")
+                    elif vm == self.current_service_vm:
+                        ax.set_title(f"{m_key.upper()} {vm} 🟢", 
+                                     color="green", fontweight="bold")
+                    else:
+                        ax.set_title(f"{m_key.upper()} {vm}")
+                        
+                    ax.set_ylim(0, 100); ax.legend(loc="upper right")
+            
+            dec = self.last_decision
+            if dec["decision"] == "migrate":
+                title = (f"🔴 DÉCISION : MIGRATE "
+                         f"{dec.get('from_vm', '?')} → {dec.get('to_vm', '?')}"
+                         f"  |  {dec.get('reason', '')}")
+                color = "red"
+            else:
+                title = f"🟢 DÉCISION : STAY  |  {dec.get('reason', 'Nominal')}"
+                color = "green"
+
+            fig.suptitle(title, fontsize=11, color=color, 
+                         fontweight="bold", y=0.02)
+            
             plt.tight_layout(); plt.pause(1)
 
 # --- HUB (CORE) ---
@@ -506,11 +595,13 @@ class OrchestratorCore:
         self.metrics_mgr = MetricsManagerSpoke()
         self.collector = CollectorSpoke(config)
         self.latency_mgr = LatencyManagerSpoke(config, self)
+        self._lock = threading.RLock()
         
         self.mode = "classic"
         self.current_slos = []
         self.last_real_data_ts = None
         self.last_migration_ts = None
+        self.service_vm = None  # VM qui héberge le service
         self.start_ts = time.time()
         self.app = Flask(f"{__name__}_core")
         self._setup_routes()
@@ -520,28 +611,38 @@ class OrchestratorCore:
         def get_status():
             return jsonify({
                 "mode": self.mode, "uptime": int(time.time() - self.start_ts), 
-                "slos": self.current_slos
+                "slos": self.current_slos,
+                "service_vm": self.service_vm
             }), 200
 
     def set_user_intent(self, text: str):
-        slos = self.intent_mgr.query_intent_engine(text)
-        is_fail = any(s["metric"] == "latency" and s["threshold"] == 50 for s in slos) and \
-                  any(s["metric"] == "cpu_usage" and s["threshold"] == 75 for s in slos)
+        slos, success = self.intent_mgr.query_intent_engine(text)
         
-        if is_fail:
+        total_weight = sum(s.get("weight", 0) for s in slos)
+        if total_weight > 0 and abs(total_weight - 1.0) > 0.01:
+            for s in slos:
+                s["weight"] = round(s.get("weight", 0) / total_weight, 3)
+                
+        if not success:
             logger.critical(f"{Fore.RED}LLM timeout — SLOs non extraits. Renvoie ton intention.")
             return
 
-        self.current_slos = slos
-        self.viz.current_slos = slos
-        self.mode = "enhanced"
+        with self._lock:
+            self.current_slos = slos
+            self.viz.current_slos = slos
+            self.mode = "enhanced"
         logger.info(f"[Core] Enhanced Mode Enabled. SLOs: {slos}")
 
+    def set_last_real_data_ts(self, ts: float) -> None:
+        with self._lock:
+            self.last_real_data_ts = ts
+
     def _check_cooldown(self) -> Optional[Dict]:
-        if self.last_migration_ts and (time.time() - self.last_migration_ts < self.config.COOLDOWN_SECONDS):
-            rem = int(self.config.COOLDOWN_SECONDS - (time.time() - self.last_migration_ts))
-            logger.info(f"{Fore.YELLOW}⏳ COOLDOWN ACTIF — Prochaine évaluation dans {rem}s")
-            return {"decision": "stay", "reason": "Cooldown actif"}
+        with self._lock:
+            if self.last_migration_ts and (time.time() - self.last_migration_ts < self.config.COOLDOWN_SECONDS):
+                rem = int(self.config.COOLDOWN_SECONDS - (time.time() - self.last_migration_ts))
+                logger.info(f"{Fore.YELLOW}⏳ COOLDOWN ACTIF — Prochaine évaluation dans {rem}s")
+                return {"decision": "stay", "reason": "Cooldown actif"}
         return None
 
     def _filter_active_metrics(self, collected: Dict, active_metrics: List[str]) -> Dict:
@@ -554,6 +655,11 @@ class OrchestratorCore:
     def run_classic_flow(self, measurements: List[Dict]) -> Dict:
         """Executes the standard 7-step network-centric migration flow."""
         self._print_cycle_header()
+        
+        with self._lock:
+            if self.service_vm is None and measurements:
+                self.service_vm = measurements[0]["vm_id"]
+            current_mode = self.mode
         
         # Steps 1-4: Observation & Prediction
         log_step("1. STORE METRICS", "Core -> Database", measurements)
@@ -570,7 +676,7 @@ class OrchestratorCore:
         
         # Decision step with Cooldown
         cooldown = self._check_cooldown()
-        dec = cooldown if cooldown else self.decision_engine.evaluate_classic_decision(measurements, preds)
+        dec = cooldown if cooldown else self.decision_engine.evaluate_classic_decision(measurements, preds, self.service_vm)
         
         log_step("6. RETOUR DÉCISION", "DecisionIntelligence -> Core", dec)
         self.viz.update_data(measurements)
@@ -583,6 +689,9 @@ class OrchestratorCore:
         """Executes the advanced 9-step intention-centric migration flow."""
         self._print_cycle_header()
         
+        with self._lock:
+            current_mode = self.mode
+        
         # 1. Analyze
         log_step("1. ANALYZE SLOs", "Core -> MetricsManager", self.current_slos)
         needed = self.metrics_mgr.analyze_needed_metrics(self.current_slos)
@@ -592,6 +701,10 @@ class OrchestratorCore:
         log_step("2. COLLECTION REQUEST", "MetricsManager -> Collector", needed)
         enriched = [{**rm, **self._filter_active_metrics(self.collector.collect_vm_metrics(rm["vm_id"]), active)} for rm in rtt_measurements]
         
+        with self._lock:
+            if self.service_vm is None and enriched:
+                self.service_vm = enriched[0]["vm_id"]
+
         log_step("3. STORE METRICS", "Collector -> Database", enriched)
         self.db.save_metrics(enriched, "enhanced")
         
@@ -606,7 +719,7 @@ class OrchestratorCore:
         
         # Decision step with Cooldown
         cooldown = self._check_cooldown()
-        dec = cooldown if cooldown else self.decision_engine.evaluate_enhanced_decision(enriched, preds_map, self.current_slos)
+        dec = cooldown if cooldown else self.decision_engine.evaluate_enhanced_decision(enriched, preds_map, self.current_slos, self.service_vm)
         
         log_step("8. RETOUR DÉCISION", "DecisionIntelligence -> Core", dec)
         self.viz.update_data(enriched)
@@ -619,11 +732,22 @@ class OrchestratorCore:
         log_step(f"9. COMMAND" if mode == "enhanced" else "7. COMMAND", "Core -> Master", dec)
         ack = self._send_to_master(dec, mode)
         self.db.save_decision(dec, mode, ack)
+        
+        if dec["decision"] == "stay":
+            self.viz.update_decision(dec)
+        
         self._log_final(dec)
 
     def _send_to_master(self, dec: Dict, mode: str) -> bool:
         if dec["decision"] == "stay": return True
-        self.last_migration_ts = time.time()
+        with self._lock:
+            self.last_migration_ts = time.time()
+            if dec.get("to_vm"):
+                self.service_vm = dec["to_vm"]
+        
+        self.viz.update_decision(dec)
+        self.viz.current_service_vm = self.service_vm
+
         try:
             payload = {**dec, "service": "my_service", "mode": mode, "timestamp": datetime.now(timezone.utc).isoformat()}
             resp = requests.post(self.config.MASTER_URL, json=payload, timeout=self.config.MASTER_TIMEOUT)
@@ -641,8 +765,57 @@ class OrchestratorCore:
         logger.info(f"{color}{Style.BRIGHT}══ DÉCISION : {dec['decision'].upper()} | {dec['reason']} ══")
         print(f"{Fore.WHITE}{'═'*60}")
 
+    def _health_check(self):
+        """Verifies system readiness before startup."""
+        print(f"\n{Fore.CYAN}{Style.BRIGHT}🔍 EXÉCUTION DU BILAN DE SANTÉ...{Style.RESET_ALL}")
+        results = []
+        
+        # 1. SQLite Check
+        try:
+            with sqlite3.connect(self.config.DB_NAME) as conn:
+                conn.execute("SELECT 1")
+            results.append(f"{Fore.GREEN}✅ SQLite OK")
+        except Exception as e:
+            logger.critical(f"Impossible d'accéder à SQLite ({self.config.DB_NAME}): {e}")
+            sys.exit(1)
+
+        # 2. Ports Check (8000, 8010, 8014)
+        ports_to_check = [self.config.CORE_PORT, self.config.LATENCY_PORT, self.config.INTENT_PORT]
+        ports_ok = True
+        for port in ports_to_check:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                try:
+                    s.bind(("0.0.0.0", port))
+                except socket.error:
+                    logger.critical(f"Port {port} déjà occupé.")
+                    ports_ok = False
+        if not ports_ok: sys.exit(1)
+        results.append(f"{Fore.GREEN}✅ Ports libres")
+
+        # 3. Ollama Check
+        try:
+            requests.get("http://localhost:11434", timeout=3)
+            results.append(f"{Fore.GREEN}✅ Ollama détecté")
+        except Exception:
+            results.append(f"{Fore.YELLOW}⚠️ Ollama non détecté (mode classic uniquement)")
+            logger.warning("Ollama non détecté sur http://localhost:11434")
+
+        # 4. ML APIs Check (5001, 5002, 5003)
+        ml_ports = [5001, 5002, 5003]
+        for port in ml_ports:
+            try:
+                requests.get(f"http://localhost:{port}", timeout=2)
+                results.append(f"{Fore.GREEN}✅ ML API {port} OK")
+            except Exception:
+                results.append(f"{Fore.YELLOW}⚠️ ML API {port} non détectée (simulation activée)")
+                logger.warning(f"ML API sur le port {port} injoignable.")
+
+        print("\n".join(results))
+        print(f"{Fore.CYAN}{'─'*30}\n")
+
     def start(self):
         """Initializes all services and starts the background simulation loops."""
+        self._health_check()
         self.db.init_db()
         self.latency_mgr.start_api()
         self.intent_mgr.start_api()
@@ -652,10 +825,16 @@ class OrchestratorCore:
         
         logger.info("Orchestrator Hub-and-Spoke started.")
         while True:
-            # Simulated data every interval if no real data is incoming
-            if self.last_real_data_ts is None or (time.time() - self.last_real_data_ts > 30):
-                sim = [{"vm_id": vm, "rtt_ms": random.uniform(5, 100)} for vm in self.config.VM_LIST]
-                self.run_enhanced_flow(sim) if self.mode == "enhanced" else self.run_classic_flow(sim)
+            with self._lock:
+                last_ts = self.last_real_data_ts
+            if last_ts is None:
+                logger.warning("⚠️ En attente des données PiCar/Raspberry...")
+            elif time.time() - last_ts > 30:
+                elapsed = int(time.time() - last_ts)
+                logger.warning(
+                    f"⚠️ Aucune donnée reçue depuis {elapsed}s "
+                    f"— Vérifier la connexion PiCar/Raspberry"
+                )
             time.sleep(self.config.COLLECTION_INTERVAL)
 
 if __name__ == "__main__":

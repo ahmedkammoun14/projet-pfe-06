@@ -119,8 +119,9 @@ class TestIntentExtraction:
     def test_parse_slos_valid_json(self, intent_mgr):
         """Vérifie l'extraction d'un JSON valide retourné par le LLM."""
         llm_output = '[{"metric": "latency", "operator": "<", "threshold": 25, "unit": "ms", "weight": 1.0}]'
-        slos = intent_mgr._parse_slos_from_text(llm_output)
+        slos, success = intent_mgr._parse_slos_from_text(llm_output)
         
+        assert success is True
         assert len(slos) == 1
         assert slos[0]["metric"] == "latency"
         assert slos[0]["threshold"] == 25
@@ -128,8 +129,9 @@ class TestIntentExtraction:
     def test_parse_slos_regex_fallback(self, intent_mgr):
         """Vérifie le fallback regex si le JSON est malformé."""
         bad_output = "I want latency < 30 and cpu < 60 please."
-        slos = intent_mgr._parse_slos_from_text(bad_output)
+        slos, success = intent_mgr._parse_slos_from_text(bad_output)
         
+        assert success is True
         metrics = [s["metric"] for s in slos]
         assert "latency" in metrics
         assert "cpu_usage" in metrics

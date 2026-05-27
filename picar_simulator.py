@@ -56,7 +56,7 @@ async def run_cycle(client: httpx.AsyncClient, cycle_num: int):
 
     # 4. Envoi au Latency Manager
     try:
-        resp = await client.post(LATENCY_MANAGER_URL, json=payload, timeout=2.0)
+        resp = await client.post(LATENCY_MANAGER_URL, json=payload, timeout=5.0)
         resp.raise_for_status()
         logger.info(f"[PICAR] Envoi → POST {LATENCY_MANAGER_URL} → status {resp.status_code}")
     except (httpx.ConnectError, httpx.HTTPStatusError, httpx.TimeoutException):
