@@ -14,14 +14,14 @@ The project follows a modular **Hub-and-Spoke** design where a central **Hub (Co
 ### Spokes & Responsibilities
 | Spoke | Port | Responsibility |
 | :--- | :--- | :--- |
-| **Core** | `8000` | Central orchestration, state management, and flow routing. |
+| **Core** | `8000` | Central orchestration, state management (Service VM tracking), and flow routing. |
 | **LatencyManager** | `8010` | Receives RTT measurements from sensors (e.g., Picar). |
 | **MLPredictor** | `8011` | Interface for QoS prediction APIs (Normalization/Denormalization). |
 | **Collector** | `8012` | Asynchronous collection of physical metrics (CPU/RAM) from VMs. |
-| **DecisionIntelligence** | `8013` | Algorithms for threshold-based and SLO-based decisions. |
-| **IntentManager** | `8014` | LLM interface for extracting SLOs from natural language. |
+| **DecisionIntelligence** | `8013` | Service-centric algorithms for threshold-based and SLO-based decisions. |
+| **IntentManager** | `8014` | LLM interface for extracting and normalizing SLOs from natural language. |
 | **Config** | `8015` | Dynamic runtime configuration and threshold management. |
-| **Observability** | `8016` | Real-time visual dashboard using Matplotlib. |
+| **Observability** | `8016` | Real-time visual dashboard with service location and decision tracking. |
 | **Database** | `8020` | Thread-safe SQLite persistence for metrics and decisions. |
 | **HistoryLoader** | `8021` | Historical data window extraction for ML and Analysis. |
 | **MetricsManager** | `8022` | Dependency analysis for SLO metrics. |
@@ -93,10 +93,11 @@ python orchestrator.py
 
 ## 🔄 New Features (v2.1)
 
-- **Predictive Multi-Criteria Decision**: Migrations are now decided based on a weighted analysis of predicted RTT, CPU, and RAM usage.
+- **Service-Centric Decision Logic**: The system now tracks the specific VM hosting the service and only evaluates migration for that node, improving efficiency.
+- **Automated SLO Normalization**: Integrated logic to ensure that SLO weights extracted by the LLM always sum to 1.0, preventing biased decision scoring.
+- **Enhanced Observability Dashboard**: Real-time Matplotlib visualization now highlights the active Service VM (Green) and displays live migration decisions (STAY/MIGRATE) with reasons.
 - **Migration Cooldown**: A 60-second cooldown is enforced between migrations to prevent "flapping" (unstable oscillation between nodes).
-- **Visual Logs**: A video demo of the system in action is available at `logs_mode_classic.webm`.
-- **Robust Testing**: Comprehensive test suite in `test_orchestrator.py` covering core logic and integration.
+- **Robust Testing**: Comprehensive test suite in `test_orchestrator.py` covering core logic, weight normalization, and service tracking.
 
 ---
 
@@ -106,7 +107,7 @@ python orchestrator.py
 | :--- | :--- | :--- | :--- |
 | `POST` | `/rtt` | `8010` | Send real RTT measurements (Picar format). |
 | `POST` | `/intent` | `8014` | Send natural language intent to the LLM. |
-| `GET` | `/status` | `8000` | Retrieve current mode, uptime, and SLOs. |
+| `GET` | `/status` | `8000` | Retrieve current mode, uptime, SLOs, and active **Service VM**. |
 | `POST` | `/mode` | `8000` | Manually switch between `classic` and `enhanced`. |
 | `POST` | `/slos` | `8000` | Manually update SLO objects. |
 
@@ -128,7 +129,7 @@ Invoke-RestMethod -Method Get -Uri "http://localhost:8000/status"
 ---
 
 ## 📁 Project Structure
-- `orchestrator.py`: The main Hub-and-Spoke script (600+ lines).
+- `orchestrator.py`: The main Hub-and-Spoke script (700+ lines).
 - `vm_simulator.py`: Simulator for 4 VMs with REST health/metrics endpoints.
 - `picar_simulator.py`: Reporter script simulating a mobile sensor.
 - `test_orchestrator.py`: Robust test suite (12+ Unit and Integration tests).
@@ -148,6 +149,6 @@ Invoke-RestMethod -Method Get -Uri "http://localhost:8000/status"
 | **ML CPU** | RNN (Recurrent Neural Network) |
 | **ML RAM** | LSTM (Long Short-Term Memory) |
 | **Database** | SQLite 3 |
-| **Visualisation** | Matplotlib (Real-time dashboard) |
+| **Visualisation** | Matplotlib (Real-time dashboard with Decision Feedback) |
 | **Terminal UI** | Colorama (Color-coded logging) |
 | **Testing** | Pytest |
