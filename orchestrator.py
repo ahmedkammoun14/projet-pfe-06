@@ -445,9 +445,16 @@ class DecisionIntelligenceSpoke:
             
             # Filter valid targets
             targets = [e for e in current_data if e["vm_id"] != worst_vm]
+            
+            def target_respects_slo(t: Dict, s: Dict) -> bool:
+                key = "rtt_ms" if s["metric"] == "latency" else s["metric"]
+                val = t.get(key)
+                if val is None:
+                    return True
+                return val <= s["threshold"]
+
             valid = [t for t in targets if all(
-                t.get("rtt_ms" if s["metric"] == "latency" else s["metric"], 999) <= s["threshold"] 
-                for s in slos
+                target_respects_slo(t, s) for s in slos
             )]
             
             final_pool = valid if valid else targets
@@ -646,6 +653,8 @@ class OrchestratorCore:
         return None
 
     def _filter_active_metrics(self, collected: Dict, active_metrics: List[str]) -> Dict:
+        if not collected or "vm_id" not in collected:
+            return {}
         res = {"vm_id": collected["vm_id"]}
         for m in ["cpu_usage", "ram_usage"]:
             if m in active_metrics and m in collected:
@@ -658,8 +667,8 @@ class OrchestratorCore:
         
         with self._lock:
             if self.service_vm is None and measurements:
-                self.service_vm = measurements[0]["vm_id"]
-            current_mode = self.mode
+                self.service_vm = min(measurements, key=lambda x: x["rtt_ms"])["vm_id"]
+                logger.info(f"[Core] Service initialisé sur {self.service_vm} (meilleur RTT du premier cycle)")
         
         # Steps 1-4: Observation & Prediction
         log_step("1. STORE METRICS", "Core -> Database", measurements)
@@ -689,9 +698,6 @@ class OrchestratorCore:
         """Executes the advanced 9-step intention-centric migration flow."""
         self._print_cycle_header()
         
-        with self._lock:
-            current_mode = self.mode
-        
         # 1. Analyze
         log_step("1. ANALYZE SLOs", "Core -> MetricsManager", self.current_slos)
         needed = self.metrics_mgr.analyze_needed_metrics(self.current_slos)
@@ -703,7 +709,8 @@ class OrchestratorCore:
         
         with self._lock:
             if self.service_vm is None and enriched:
-                self.service_vm = enriched[0]["vm_id"]
+                self.service_vm = min(enriched, key=lambda x: x.get("rtt_ms", 999))["vm_id"]
+                logger.info(f"[Core] Service initialisé sur {self.service_vm} (meilleur RTT du premier cycle)")
 
         log_step("3. STORE METRICS", "Collector -> Database", enriched)
         self.db.save_metrics(enriched, "enhanced")
@@ -746,7 +753,6 @@ class OrchestratorCore:
                 self.service_vm = dec["to_vm"]
         
         self.viz.update_decision(dec)
-        self.viz.current_service_vm = self.service_vm
 
         try:
             payload = {**dec, "service": "my_service", "mode": mode, "timestamp": datetime.now(timezone.utc).isoformat()}
