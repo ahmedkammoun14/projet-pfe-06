@@ -129,6 +129,7 @@ class IntentHandler(Protocol):
     def get_recent_context(self, window_seconds: int) -> List[Dict]: ...
     def get_metric_percentile(self, metric: str, percentile: float, window_seconds: int) -> Optional[float]: ...
     def get_metrics_for_mi(self, window_seconds: int) -> List[Dict]: ...
+    def get_migration_cost(self, vm_id: str, window_seconds: int) -> int: ...
 
 # --- CONFIGURATION ---
 
@@ -175,6 +176,8 @@ class Config:
     MASTER_TOKEN: str = "changeme"
     MASTER_TIMEOUT: int = 10
     COOLDOWN_SECONDS: int = 60
+    PROACTIVE_FACTOR: float = 0.85
+    HORIZON_ALERT: int = 3
 
 # --- SPOKES (SERVICES) ---
 
@@ -836,10 +839,60 @@ class CollectorSpoke:
                 "ram_usage": random.uniform(30, 90),
                 "is_active_service": False
             }
+@dataclass
+class PredictionResult:
+    """Encapsulates ML predictions with confidence intervals."""
+    predictions: List[float]
+    uncertainty: float        # scalar [0.0, 1.0]
+    confidence_low: List[float] = field(default_factory=list)
+    confidence_high: List[float] = field(default_factory=list)
+
+    def __eq__(self, other):
+        if isinstance(other, list):
+            return self.predictions == other
+        if not isinstance(other, PredictionResult):
+            return False
+        return (self.predictions == other.predictions and 
+                self.uncertainty == other.uncertainty and 
+                self.confidence_low == other.confidence_low and 
+                self.confidence_high == other.confidence_high)
+
 class MLPredictorSpoke:
     """Handles communication with specialized Machine Learning prediction APIs."""
     def __init__(self, config: Config): 
         self.config = config
+        self.window_sizes: Dict[str, Optional[int]] = {
+            "latency": None,
+            "cpu_usage": None,
+            "ram_usage": None
+        }
+
+    def fetch_window_sizes(self) -> None:
+        """Appelle GET /hyperparameters sur les 3 serveurs
+        et stocke window_size par métrique.
+        Si serveur not_ready ou injoignable :
+        window_size reste None → fallback HISTORY_WINDOW."""
+        
+        urls = {
+            "latency":   self.config.ML_RTT_URL,
+            "cpu_usage": self.config.ML_CPU_URL,
+            "ram_usage": self.config.ML_RAM_URL
+        }
+        for metric, url in urls.items():
+            base = url.replace("/predict", "")
+            try:
+                resp = requests.get(f"{base}/hyperparameters", timeout=5)
+                data = resp.json()
+                if data.get("status") == "ready":
+                    self.window_sizes[metric] = data["window_size"]
+                    logger.info(
+                        f"[ML] {metric} window_size={data['window_size']} "
+                        f"({data['forecasting_model']})"
+                    )
+                else:
+                    logger.warning(f"[ML] {metric} not ready — fallback HISTORY_WINDOW")
+            except Exception as e:
+                logger.warning(f"[ML] {metric} hyperparameters unreachable: {e}")
 
     def _parse_numpy_string(self, raw_str: str) -> List[float]:
         """Parses a string representation of a numpy array into a list of floats."""
@@ -854,6 +907,36 @@ class MLPredictorSpoke:
         except Exception:
             return None
 
+    def _get_sequence_prediction(self, metric: str, sequence: List[float]) -> Optional[Dict]:
+        """
+        Appelle le endpoint /predict_sequence avec une séquence historique.
+        
+        Args:
+            metric: Le nom de la métrique (latency, cpu_usage, ram_usage).
+            sequence: La liste des valeurs historiques.
+            
+        Returns:
+            Le dictionnaire complet de la réponse JSON ou None en cas d'erreur.
+        """
+        urls = {
+            "latency": self.config.ML_RTT_URL,
+            "cpu_usage": self.config.ML_CPU_URL,
+            "ram_usage": self.config.ML_RAM_URL
+        }
+        url = urls.get(metric)
+        if not url:
+            return None
+            
+        base_url = url.replace("/predict", "")
+        try:
+            payload = {"sequence": sequence, "horizon": 5}
+            resp = requests.post(f"{base_url}/predict_sequence", json=payload, timeout=10)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception as e:
+            logger.debug(f"Sequence Prediction failed for {metric}: {e}")
+        return None
+
     def get_prediction(self, current_val: float) -> List[float]:
         """Classic mode prediction (Latency only)."""
         pred = self._get_api_prediction(self.config.ML_RTT_URL, current_val)
@@ -861,16 +944,74 @@ class MLPredictorSpoke:
         logger.warning("[ML] Latency API unavailable -> Local simulation fallback")
         return [current_val * (1.05 ** i) for i in range(1, 6)]
 
-    def get_enhanced_prediction(self, metric: str, current_val: float) -> List[float]:
-        """Enhanced mode prediction for multi-metrics."""
-        urls = {"latency": self.config.ML_RTT_URL, "cpu_usage": self.config.ML_CPU_URL, "ram_usage": self.config.ML_RAM_URL}
+    def get_enhanced_prediction(
+        self,
+        metric: str,
+        current_val: float,
+        vm_id: str = "unknown",
+        history_loader: Optional[Any] = None
+    ) -> PredictionResult:
+        """
+        Calcule la prédiction avec une cascade de fallbacks :
+        1. Séquence historique (via POST /predict_sequence)
+        2. Valeur courante seule (via GET /predict)
+        3. Simulation locale (multiplicateur par défaut)
+        """
+        # Niveau 1 — Séquence historique
+        if history_loader is not None:
+            window_size = self.window_sizes.get(metric)
+            if window_size is None:
+                window_size = self.config.HISTORY_WINDOW
+            
+            sequence = history_loader.load_window(vm_id, metric, window_size)
+            
+            if len(sequence) >= window_size:
+                result = self._get_sequence_prediction(metric, sequence)
+                if result and "predictions" in result:
+                    predictions = result["predictions"]
+                    low = result.get("confidence_low", [])
+                    high = result.get("confidence_high", [])
+                    
+                    uncertainty = 0.0
+                    if high and low and len(high) > 0:
+                        spreads = [h - l for h, l in zip(high, low)]
+                        mean_spread = sum(spreads) / len(spreads)
+                        ref = max(predictions) if predictions else 1.0
+                        uncertainty = min(mean_spread / (ref + 1e-9), 1.0)
+                        
+                    return PredictionResult(
+                        predictions=predictions,
+                        uncertainty=uncertainty,
+                        confidence_low=low,
+                        confidence_high=high
+                    )
+
+        # Niveau 2 — Fallback GET /predict (actuel)
+        urls = {
+            "latency": self.config.ML_RTT_URL,
+            "cpu_usage": self.config.ML_CPU_URL,
+            "ram_usage": self.config.ML_RAM_URL
+        }
         pred = self._get_api_prediction(urls.get(metric, ""), current_val)
-        if pred: return pred
+        if pred:
+            return PredictionResult(
+                predictions=pred,
+                uncertainty=0.0,
+                confidence_low=[],
+                confidence_high=[]
+            )
         
+        # Niveau 3 — Simulation locale
         logger.warning(f"[ML] {metric} API unavailable -> Local simulation fallback")
         factors = {"latency": 1.05, "cpu_usage": 1.03, "ram_usage": 1.02}
         f = factors.get(metric, 1.01)
-        return [current_val * (f ** i) for i in range(1, 6)]
+        local_preds = [current_val * (f ** i) for i in range(1, 6)]
+        return PredictionResult(
+            predictions=local_preds,
+            uncertainty=0.5, # Incertitude moyenne par défaut pour simulation
+            confidence_low=[],
+            confidence_high=[]
+        )
 
 class DecisionIntelligenceSpoke:
     """Core decision engine implementing threshold and predictive logic."""
@@ -947,7 +1088,198 @@ class DecisionIntelligenceSpoke:
         # 3. Final score: pred - budget_bonus (capped bonus at 1.0)
         return score_pred - min(budget_bonus, 1.0)
 
-    def evaluate_enhanced_decision(self, current_data: List[Dict], predictions_map: Dict[str, Dict[str, List[float]]], slos: List[Dict], service_vm=None) -> Dict:
+    def _topsis_select(
+        self,
+        candidates: List[Dict],
+        predictions_map: Dict,
+        slos: List[Dict],
+        weights: Dict[str, float],
+        migration_costs: Optional[Dict[str, int]] = None
+    ) -> Dict:
+        """
+        Technique for Order of Preference by Similarity to Ideal Solution (TOPSIS).
+        Selects the best VM candidate by minimizing distance to ideal and maximizing distance to anti-ideal.
+        Includes migration_cost as a 6th criterion to penalize frequently moved VMs.
+        
+        Args:
+            candidates: List of candidate VM dictionaries.
+            predictions_map: Map of predictions for all VMs.
+            slos: List of active SLO objects.
+            weights: Weight mapping for metrics.
+            migration_costs: Map of recent migration counts per VM.
+            
+        Returns:
+            The best candidate VM dictionary.
+        """
+        if not candidates:
+            return {}
+        if len(candidates) == 1:
+            return candidates[0]
+
+        # 1. ÉTAPE 1 — Construire la matrice de décision
+        # Critères : moyennes prédites pour chaque métrique des SLOs + budget_score global + migration_cost
+        metric_names = list(set(s["metric"] for s in slos))
+        num_candidates = len(candidates)
+        num_metrics = len(metric_names)
+        
+        # On a num_metrics critères + 1 budget_score + 1 migration_cost
+        matrix = []
+        for i, cand in enumerate(candidates):
+            row = []
+            vm_id = cand["vm_id"]
+            vm_preds = predictions_map.get(vm_id, {})
+            
+            # Critères métriques
+            for m in metric_names:
+                preds = vm_preds.get(m, [])
+                if isinstance(preds, PredictionResult):
+                    row.append(calculate_weighted_mean(preds.predictions))
+                else:
+                    row.append(calculate_weighted_mean(preds))
+            
+            # Critère budget_score (1 - budget_bonus)
+            budget_bonus = 0.0
+            for slo in slos:
+                m_name, threshold = slo["metric"], slo["threshold"]
+                val = cand.get("rtt_ms" if m_name == "latency" else m_name)
+                if val is not None and val <= threshold:
+                    bonus = slo.get("weight", 0.0) * (slo.get("budget_remaining", 100.0) / 100.0)
+                    budget_bonus += bonus
+            
+            row.append(1.0 - min(budget_bonus, 1.0))
+            
+            # Critère migration_cost_score
+            vm_migration_count = migration_costs.get(vm_id, 0) if migration_costs else 0
+            row.append(float(vm_migration_count))
+            
+            matrix.append(row)
+
+        num_criteria = num_metrics + 2
+        
+        # 2. ÉTAPE 2 — Normalisation min-max par colonne
+        normalized = [[0.0] * num_criteria for _ in range(num_candidates)]
+        for k in range(num_criteria):
+            col = [matrix[i][k] for i in range(num_candidates)]
+            c_min, c_max = min(col), max(col)
+            if c_max == c_min:
+                for i in range(num_candidates):
+                    normalized[i][k] = 0.0
+            else:
+                for i in range(num_candidates):
+                    normalized[i][k] = (matrix[i][k] - c_min) / (c_max - c_min)
+
+        # 3. ÉTAPE 3 — Pondération
+        criterion_weights = []
+        for m in metric_names:
+            criterion_weights.append(weights.get(m, 0.0))
+        criterion_weights.append(1.0) # budget_score
+        criterion_weights.append(0.5) # migration_cost_score
+        
+        weighted = [[0.0] * num_criteria for _ in range(num_candidates)]
+        for i in range(num_candidates):
+            for k in range(num_criteria):
+                weighted[i][k] = normalized[i][k] * criterion_weights[k]
+
+        # 4. ÉTAPE 4 — Solution idéale A+ et anti-idéale A-
+        # Tous les critères sont à MINIMISER
+        A_plus = [min(weighted[i][k] for i in range(num_candidates)) for k in range(num_criteria)]
+        A_minus = [max(weighted[i][k] for i in range(num_candidates)) for k in range(num_criteria)]
+
+        # 5. ÉTAPE 5 — Distances euclidiennes
+        dist_plus = []
+        dist_minus = []
+        for i in range(num_candidates):
+            d_plus = math.sqrt(sum((weighted[i][k] - A_plus[k])**2 for k in range(num_criteria)))
+            d_minus = math.sqrt(sum((weighted[i][k] - A_minus[k])**2 for k in range(num_criteria)))
+            dist_plus.append(d_plus)
+            dist_minus.append(d_minus)
+
+        # 6. ÉTAPE 6 — Score TOPSIS
+        scores = []
+        for i in range(num_candidates):
+            total_dist = dist_plus[i] + dist_minus[i]
+            if total_dist == 0:
+                scores.append(0.0)
+            else:
+                scores.append(dist_minus[i] / total_dist)
+
+        # 7. ÉTAPE 7 — Sélection
+        best_idx = 0
+        max_score = scores[0]
+        for i in range(1, num_candidates):
+            if scores[i] > max_score:
+                max_score = scores[i]
+                best_idx = i
+        
+        best_vm = candidates[best_idx]
+        best_vm["topsis_score"] = round(max_score, 4)
+        return best_vm
+
+    def _analyze_predictions(
+        self,
+        preds: List[float],
+        threshold: float,
+        current_val: float,
+        proactive_factor: float = 0.85,
+        horizon_alert: int = 3
+    ) -> Dict:
+        """
+        Analyzes future trends to detect both reactive and proactive breaches.
+        
+        Args:
+            preds: List of predicted values.
+            threshold: The SLO threshold.
+            current_val: Current metric value.
+            proactive_factor: Multiplier for early warning threshold.
+            horizon_alert: Number of steps to look ahead for proactive alerts.
+            
+        Returns:
+            Dictionary with breach status, time_to_breach, slope, and type.
+        """
+        # Breach réactif (inchangé)
+        breach_reactive = current_val > threshold
+
+        # Calcul slope sur les prédictions
+        if len(preds) >= 2:
+            slope = preds[-1] - preds[0]
+        else:
+            slope = 0.0
+
+        # time_to_breach : steps avant pred > threshold
+        time_to_breach = len(preds) + 1  # ∞ par défaut
+        for i, p in enumerate(preds):
+            if p > threshold:
+                time_to_breach = i + 1
+                break
+
+        # Breach proactif :
+        # Condition 1 : au moins une prédiction dépasse threshold × proactive_factor
+        # Condition 2 : time_to_breach ≤ horizon_alert
+        # Condition 3 : val courante > threshold × 0.70 (évite faux positifs purs)
+        proactive_threshold = threshold * proactive_factor
+        cond1 = any(p > proactive_threshold for p in preds)
+        cond2 = time_to_breach <= horizon_alert
+        cond3 = current_val > threshold * 0.70
+
+        breach_proactive = (cond1 or cond2) and cond3 and not breach_reactive
+
+        # Déterminer breach_type
+        if breach_reactive:
+            breach_type = "reactive"
+        elif breach_proactive:
+            breach_type = "proactive"
+        else:
+            breach_type = "none"
+
+        return {
+            "breach_reactive": breach_reactive,
+            "breach_proactive": breach_proactive,
+            "time_to_breach": time_to_breach,
+            "slope": slope,
+            "breach_type": breach_type
+        }
+
+    def evaluate_enhanced_decision(self, current_data: List[Dict], predictions_map: Dict[str, Dict[str, Any]], slos: List[Dict], service_vm=None, migration_costs: Optional[Dict[str, int]] = None) -> Dict:
         """Intention-based decision using multi-criteria weighted scoring with severity prioritization and budget awareness."""
         weights = {m: 0.0 for m in ["latency", "cpu_usage", "ram_usage"]}
         for s in slos: weights[s["metric"]] = s.get("weight", 0.0)
@@ -971,15 +1303,52 @@ class DecisionIntelligenceSpoke:
                 
                 if val is None: continue
                 
-                preds = predictions_map.get(vm_id, {}).get(m_name, [])
-                if val > threshold or calculate_weighted_mean(preds) > threshold:
-                    severity = (val - threshold) / threshold if threshold > 0 else val
+                pred_result = predictions_map.get(vm_id, {}).get(m_name)
+
+                # Extraire predictions (compatibilité List[float] et PredictionResult)
+                if isinstance(pred_result, PredictionResult):
+                    preds = pred_result.predictions
+                    uncertainty = pred_result.uncertainty
+                elif isinstance(pred_result, list):
+                    preds = pred_result
+                    uncertainty = 0.0
+                else:
+                    preds = []
+                    uncertainty = 0.0
+
+                # Modulation dynamique de PROACTIVE_FACTOR
+                # Règle : si uncertainty > 0.5 → facteur conservateur (0.90)
+                #         sinon               → facteur nominal config
+                UNCERTAINTY_THRESHOLD: float = 0.5
+                CONSERVATIVE_FACTOR: float = 0.90
+                effective_factor = (
+                    CONSERVATIVE_FACTOR
+                    if uncertainty > UNCERTAINTY_THRESHOLD
+                    else self.config.PROACTIVE_FACTOR
+                )
+
+                analysis = self._analyze_predictions(
+                    preds, threshold, val,
+                    effective_factor,
+                    self.config.HORIZON_ALERT
+                )
+
+                if analysis["breach_type"] != "none":
+                    if analysis["breach_type"] == "reactive":
+                        severity = (val - threshold) / threshold if threshold > 0 else val
+                    else:  # proactive
+                        severity = analysis["slope"] / threshold if threshold > 0 else 0.1
+                        severity = max(severity, 0.01)
+
                     violations.append({
                         "vm_id": vm_id,
                         "metric": m_name,
                         "val": val,
                         "threshold": threshold,
-                        "severity": severity
+                        "severity": severity,
+                        "breach_type": analysis["breach_type"],
+                        "time_to_breach": analysis["time_to_breach"],
+                        "uncertainty": uncertainty
                     })
 
         # Phase 2: Process the most severe violation first
@@ -1002,13 +1371,37 @@ class DecisionIntelligenceSpoke:
             )]
             
             final_pool = valid if valid else targets
-            # Use budget-aware scoring
-            best = min(final_pool, key=lambda t: self._compute_vm_score(t, predictions_map, slos, weights))
+            # Use TOPSIS selection
+            best = self._topsis_select(final_pool, predictions_map, slos, weights, migration_costs=migration_costs)
             
-            reason = f"{worst_vm} {worst['metric']} {worst['val']:.1f} > SLO {worst['threshold']} (Sévérité: {worst['severity']:.2f})"
-            return {"decision": "migrate", "from_vm": worst_vm, "to_vm": best["vm_id"], "reason": reason}
+            breach_info = worst.get("breach_type", "reactive")
+            ttb = worst.get("time_to_breach", 0)
+            
+            if breach_info == "proactive":
+                reason = (
+                    f"{worst_vm} {worst['metric']} {worst['val']:.1f} → "
+                    f"breach prédit dans {ttb} step(s) "
+                    f"(Sévérité: {worst['severity']:.2f}, "
+                    f"Incertitude: {worst.get('uncertainty', 0.0):.2f})"
+                )
+            else:
+                reason = (
+                    f"{worst_vm} {worst['metric']} {worst['val']:.1f} > "
+                    f"SLO {worst['threshold']} "
+                    f"(Sévérité: {worst['severity']:.2f})"
+                )
+
+            return {
+                "decision": "migrate", 
+                "from_vm": worst_vm, 
+                "to_vm": best["vm_id"], 
+                "reason": reason,
+                "topsis_score": best.get("topsis_score", 0.0),
+                "selection_method": "topsis"
+            }
 
         return {"decision": "stay", "reason": "All SLOs satisfied"}
+
 
 class DatabaseSpoke:
     """Persistent thread-safe storage for metrics and decisions."""
@@ -1063,6 +1456,27 @@ class DatabaseSpoke:
             conn.execute("INSERT INTO decisions (decision, from_vm, to_vm, reason, mode, master_ack, budget_remaining, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", 
                          (dec["decision"], dec.get("from_vm"), dec.get("to_vm"), dec["reason"], mode, 1 if ack else 0, dec.get("budget_remaining", 100.0), ts))
         return True
+
+    @safe_call(0, "DatabaseSpoke.get_migration_count")
+    def get_migration_count(self, vm_id: str, window_seconds: int = 300) -> int:
+        """
+        Returns the number of times vm_id was the TARGET of a migration (to_vm = vm_id) 
+        within the last window_seconds.
+
+        Args:
+            vm_id: Target VM identifier.
+            window_seconds: Lookback window in seconds.
+
+        Returns:
+            Count of migrations toward this VM.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=window_seconds)).isoformat()
+        with sqlite3.connect(self.config.DB_NAME) as conn:
+            cur = conn.execute(
+                "SELECT COUNT(*) FROM decisions WHERE to_vm = ? AND decision = 'migrate' AND timestamp > ?",
+                (vm_id, cutoff)
+            )
+            return cur.fetchone()[0]
 
     def get_slo_violations(self, metric: str, threshold: float, operator: str, window_seconds: int) -> int:
         """Counts metrics rows where the value exceeds the SLO threshold within a window.
@@ -1402,6 +1816,19 @@ class OrchestratorCore:
         """
         return self.db.get_metrics_with_violations(window_seconds)
 
+    def get_migration_cost(self, vm_id: str, window_seconds: int = 300) -> int:
+        """
+        Hub method to expose migration count for a VM without direct spoke-to-spoke access.
+
+        Args:
+            vm_id: VM identifier.
+            window_seconds: Lookback window in seconds.
+
+        Returns:
+            Number of recent migrations toward this VM.
+        """
+        return self.db.get_migration_count(vm_id, window_seconds)
+
     def set_user_intent(self, text: str):
         slos, success = self.intent_mgr.query_intent_engine(text)
         
@@ -1453,6 +1880,9 @@ class OrchestratorCore:
         for m in ["cpu_usage", "ram_usage"]:
             if m in active_metrics and m in collected:
                 res[m] = collected[m]
+        # Propager is_active_service pour que _find_active_vm() fonctionne
+        if "is_active_service" in collected:
+            res["is_active_service"] = collected["is_active_service"]
         return res
 
     def _refresh_slo_budgets(self):
@@ -1544,19 +1974,39 @@ class OrchestratorCore:
         log_step("4. ML PREDICTION", "Core -> MLPredictor", active)
         preds_map = {
             e["vm_id"]: {
-                m: self.ml.get_enhanced_prediction(m, e.get("rtt_ms" if m == "latency" else m, 0)) 
+                m: self.ml.get_enhanced_prediction(
+                    m, 
+                    e.get("rtt_ms" if m == "latency" else m, 0),
+                    vm_id=e["vm_id"],
+                    history_loader=self.history
+                ) 
                 for m in active
             } for e in enriched
         }
-        self.viz.update_predictions(preds_map, mode="enhanced")
+        
+        # extraction .predictions avant passage au viz
+        viz_map = {
+            vm_id: {
+                m: result.predictions if isinstance(result, PredictionResult) else result
+                for m, result in metrics.items()
+            }
+            for vm_id, metrics in preds_map.items()
+        }
+        self.viz.update_predictions(viz_map, mode="enhanced")
         
         log_step("5. RETOUR PREDICTIONS", "MLPredictor -> Core", preds_map)
+
+        # Collecte des coûts de migration via Hub
+        migration_costs = {
+            vm_id: self.get_migration_cost(vm_id, window_seconds=300)
+            for vm_id in self.config.VM_LIST
+        }
 
         # 6. Decision logic
         log_step("6. DECISION REQUEST", "Core -> DecisionIntelligence", self.current_slos)
         cooldown = self._check_cooldown()
         dec = cooldown if cooldown else self.decision_engine.evaluate_enhanced_decision(
-            enriched, preds_map, self.current_slos, service_vm
+            enriched, preds_map, self.current_slos, service_vm, migration_costs=migration_costs
         )
         
         # 7. Update Observability
@@ -1595,15 +2045,41 @@ class OrchestratorCore:
         # 4-6. ML Workflow
         log_step("4. LOAD HISTORY", "Core -> HistoryLoader", active)
         log_step("5. ML PREDICTION REQUEST", "Core -> MLPredictor", active)
-        preds_map = {e["vm_id"]: {m: self.ml.get_enhanced_prediction(m, e.get("rtt_ms" if m == "latency" else m, 0)) for m in active} for e in enriched}
-        self.viz.update_predictions(preds_map, mode="enhanced")
+        preds_map = {
+            e["vm_id"]: {
+                m: self.ml.get_enhanced_prediction(
+                    m, 
+                    e.get("rtt_ms" if m == "latency" else m, 0),
+                    vm_id=e["vm_id"],
+                    history_loader=self.history
+                ) 
+                for m in active
+            } for e in enriched
+        }
+        
+        # extraction .predictions avant passage au viz
+        viz_map = {
+            vm_id: {
+                m: result.predictions if isinstance(result, PredictionResult) else result
+                for m, result in metrics.items()
+            }
+            for vm_id, metrics in preds_map.items()
+        }
+        self.viz.update_predictions(viz_map, mode="enhanced")
         
         log_step("6. RETOUR PREDICTIONS", "MLPredictor -> Core", preds_map)
+        
+        # Collecte des coûts de migration via Hub
+        migration_costs = {
+            vm_id: self.get_migration_cost(vm_id, window_seconds=300)
+            for vm_id in self.config.VM_LIST
+        }
+
         log_step("7. DECISION REQUEST", "Core -> DecisionIntelligence", self.current_slos)
         
         # Decision step with Cooldown
         cooldown = self._check_cooldown()
-        dec = cooldown if cooldown else self.decision_engine.evaluate_enhanced_decision(enriched, preds_map, self.current_slos, service_vm)
+        dec = cooldown if cooldown else self.decision_engine.evaluate_enhanced_decision(enriched, preds_map, self.current_slos, service_vm, migration_costs=migration_costs)
         
         log_step("8. RETOUR DÉCISION", "DecisionIntelligence -> Core", dec)
         self.viz.update_data(enriched)
@@ -1736,6 +2212,7 @@ class OrchestratorCore:
         """Initializes all services and starts the background simulation loops."""
         self._health_check()
         self.db.init_db()
+        self.ml.fetch_window_sizes()
         self.latency_mgr.start_api()
         self.intent_mgr.start_api()
         
