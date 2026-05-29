@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import math
 import random
 import re
 import socket
@@ -10,8 +11,9 @@ import sqlite3
 import sys
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Protocol, Union
 
 import colorama
@@ -115,6 +117,7 @@ class LatencyHandler(Protocol):
     @property
     def mode(self) -> str: ...
     def run_classic_flow(self, measurements: List[Dict]) -> Dict: ...
+    def run_autonomous_flow(self, measurements: List[Dict]) -> Dict: ...
     def run_enhanced_flow(self, measurements: List[Dict]) -> Dict: ...
     def set_last_real_data_ts(self, ts: float) -> None: ...
 
@@ -123,6 +126,9 @@ class IntentHandler(Protocol):
     def set_user_intent(self, text: str) -> None: ...
     @property
     def current_slos(self) -> List[Dict]: ...
+    def get_recent_context(self, window_seconds: int) -> List[Dict]: ...
+    def get_metric_percentile(self, metric: str, percentile: float, window_seconds: int) -> Optional[float]: ...
+    def get_metrics_for_mi(self, window_seconds: int) -> List[Dict]: ...
 
 # --- CONFIGURATION ---
 
@@ -194,7 +200,7 @@ class LatencyManagerSpoke:
             if self.core.mode == "enhanced":
                 decision = self.core.run_enhanced_flow(measurements)
             else:
-                decision = self.core.run_classic_flow(measurements)
+                decision = self.core.run_autonomous_flow(measurements)
                 
             return jsonify({"status": "received", "decision": decision}), 200
 
@@ -206,11 +212,174 @@ class LatencyManagerSpoke:
         ).start()
         logger.info(f"[LatencyManager] API started on port {self.config.LATENCY_PORT}")
 
+@dataclass
+class ValidationResult:
+    """Structure for SLO validation feedback and correction."""
+    is_valid: bool
+    errors: List[str]
+    warnings: List[str]
+    corrected_slos: List[Dict]
+
 class IntentManagerSpoke:
-    """Interfaces with LLM to extract SLOs from natural language."""
-    def __init__(self, config: Config, core: IntentHandler):
+    """Interfaces with LLM to extract SLOs from natural language with RAG context and validation."""
+    
+    class _SLOCoherenceValidator:
+        """Internal helper to validate physical realism and weight balance of SLOs."""
+        PHYSICAL_BOUNDS = {
+            "latency":   {"min": 5.0,  "max": 2000.0, "unit": "ms"},
+            "cpu_usage": {"min": 1.0,  "max": 99.0,   "unit": "%"},
+            "ram_usage": {"min": 1.0,  "max": 99.0,   "unit": "%"}
+        }
+
+        def validate(self, slos: List[Dict]) -> ValidationResult:
+            """Executes all validation checks and returns a structured result.
+            
+            Args:
+                slos: List of enriched SLO dictionaries.
+                
+            Returns:
+                ValidationResult with errors, warnings, and corrected list.
+            """
+            errors = []
+            warnings = []
+            
+            # 1. Physical Bounds Check
+            bound_errors = self._check_physical_bounds(slos)
+            if bound_errors:
+                errors.extend(bound_errors)
+            
+            # Filter out invalid SLOs (those that caused bound errors)
+            valid_slos = []
+            invalid_metrics = [e.split()[0] for e in bound_errors] # Crude way to identify metric
+            for s in slos:
+                if s["metric"] not in invalid_metrics:
+                    valid_slos.append(s)
+                else:
+                    warnings.append(f"REJETÉ : SLO {s['metric']} hors bornes physiques.")
+
+            if not valid_slos:
+                return ValidationResult(is_valid=False, errors=errors, warnings=warnings, corrected_slos=[])
+
+            # 2. Weight Sum Check
+            weight_errors = self._check_weight_sum(valid_slos)
+            if weight_errors:
+                errors.extend(weight_errors)
+                # Auto-correction of weights
+                w = round(1.0 / len(valid_slos), 3)
+                for s in valid_slos:
+                    s["weight"] = w
+                valid_slos[-1]["weight"] = round(1.0 - sum(s["weight"] for s in valid_slos[:-1]), 3)
+                warnings.append(f"POIDS RÉÉQUILIBRÉS : Somme était invalide, redistribuée à {1.0/len(valid_slos):.3f} par SLO.")
+
+            return ValidationResult(is_valid=True, errors=errors, warnings=warnings, corrected_slos=valid_slos)
+
+        def _check_physical_bounds(self, slos: List[Dict]) -> List[str]:
+            """Verifies that thresholds are within realistic operating ranges."""
+            errors = []
+            for s in slos:
+                metric = s["metric"]
+                val = s["threshold"]
+                bounds = self.PHYSICAL_BOUNDS.get(metric)
+                if not bounds:
+                    continue
+                
+                if val < bounds["min"] or val > bounds["max"]:
+                    errors.append(f"{metric} threshold {val}{bounds['unit']} est hors plage [{bounds['min']}, {bounds['max']}]{bounds['unit']}")
+            return errors
+
+        def _check_weight_sum(self, slos: List[Dict]) -> List[str]:
+            """Ensures the sum of weights is approximately 1.0."""
+            total = sum(s.get("weight", 0.0) for s in slos)
+            if abs(total - 1.0) > 0.01:
+                return [f"Somme des poids = {total:.2f}, attendu 1.0"]
+            return []
+
+    class _RAGContextBuilder:
+        """Internal helper to build context for LLM by querying recent performance and SLOs through the Hub."""
+        def __init__(self, config: Config, hub: IntentHandler, current_slos: List[Dict]):
+            self.config = config
+            self.hub = hub
+            self.current_slos = current_slos
+
+        def build_context(self) -> str:
+            """Aggregates historical and current data into a textual context block."""
+            if not self.current_slos:
+                return ""
+
+            try:
+                # 1. Previous SLOs
+                slo_lines = [
+                    f"- {s['metric']} {s['operator']} {s['threshold']}{s['unit']} (weight: {s.get('weight', 0)})"
+                    for s in self.current_slos
+                ]
+                slo_ctx = "Derniers SLOs actifs :\n" + "\n".join(slo_lines)
+
+                # Fetch data from Hub instead of DatabaseSpoke directly
+                recent_data = self.hub.get_recent_context(300)  # 5 minutes
+                if not recent_data:
+                    return f"{slo_ctx}\n\nAucune donnée de performance récente disponible dans SQLite."
+
+                # 2. Performance actuelle (latest point per VM)
+                latest_points: Dict[str, Dict] = {}
+                for m in recent_data:
+                    if m['vm_id'] not in latest_points:
+                        latest_points[m['vm_id']] = m
+                
+                perf_lines = [
+                    f"{vm} -> RTT: {data.get('rtt_ms', 0):.1f}ms | CPU: {data.get('cpu_usage', 0):.1f}% | RAM: {data.get('ram_usage', 0):.1f}%"
+                    for vm, data in sorted(latest_points.items())
+                ]
+                perf_ctx = "Performance actuelle des VMs :\n" + "\n".join(perf_lines)
+
+                # 3. Violations récentes (last 5 min)
+                violations = {vm: {"latency": 0, "cpu_usage": 0, "ram_usage": 0} for vm in self.config.VM_LIST}
+                for m in recent_data:
+                    for slo in self.current_slos:
+                        metric_name = slo['metric']
+                        col = "rtt_ms" if metric_name == "latency" else metric_name
+                        val = m.get(col)
+                        if val is not None and val > slo['threshold']:
+                            violations[m['vm_id']][metric_name] += 1
+                
+                viol_lines = []
+                for vm, counts in sorted(violations.items()):
+                    if sum(counts.values()) > 0:
+                        v_detail = ", ".join([f"{c} violation(s) {m}" for m, c in counts.items() if c > 0])
+                        viol_lines.append(f"{vm} : {v_detail}")
+                
+                viol_ctx = "Violations récentes (5 dernières min) :\n" + ("\n".join(viol_lines) if viol_lines else "Aucune violation détectée.")
+
+                # 4. Seuils historiquement bons (sur 1h)
+                percentile_lines = []
+                any_valid = False
+                metrics_to_check = sorted(list(set(s['metric'] for s in self.current_slos)))
+                
+                for metric in metrics_to_check:
+                    p10 = self.hub.get_metric_percentile(metric, 10.0, 3600)
+                    p25 = self.hub.get_metric_percentile(metric, 25.0, 3600)
+                    p30 = self.hub.get_metric_percentile(metric, 30.0, 3600)
+                    
+                    unit = "ms" if metric == "latency" else "%"
+                    if p10 is not None and p25 is not None and p30 is not None:
+                        percentile_lines.append(f"- {metric:10}: P10={p10:.1f}{unit} | P25={p25:.1f}{unit} | P30={p30:.1f}{unit}")
+                        any_valid = True
+                    else:
+                        percentile_lines.append(f"- {metric:10}: N/A (données insuffisantes)")
+
+                if any_valid:
+                    hist_ctx = "Seuils historiquement bons (sur 1h) :\n" + "\n".join(percentile_lines)
+                    return f"{slo_ctx}\n\n{perf_ctx}\n\n{viol_ctx}\n\n{hist_ctx}"
+
+                return f"{slo_ctx}\n\n{perf_ctx}\n\n{viol_ctx}"
+            except Exception as e:
+                logger.error(f"[RAG] Error building context: {e}")
+                return ""
+
+    def __init__(self, config: Config, core: IntentHandler, db_path: str, current_slos: List[Dict]):
         self.config = config
         self.core = core
+        self.db_path = db_path
+        self.slos_ref = current_slos
         self.app = Flask(f"{__name__}_intent")
         self._setup_routes()
 
@@ -236,23 +405,190 @@ class IntentManagerSpoke:
         ).start()
         logger.info(f"[IntentManager] API started on port {self.config.INTENT_PORT}")
 
+    class _KeywordsMatcher:
+        """Fallback matcher that detects semantic profiles from keywords."""
+        VOCABULARY = {
+            "ux_sensitive": {
+                "keywords": [
+                    "rapide", "réactif", "délai", "lent", "lente",
+                    "streaming", "interactif", "fluide", "réactivité",
+                    "latence", "ping", "temps de réponse"
+                ],
+                "metrics": ["latency", "cpu_usage"],
+                "weights": {"latency": 0.7, "cpu_usage": 0.3},
+                "percentile": 25
+            },
+            "resource_heavy": {
+                "keywords": [
+                    "surcharge", "saturation", "charge", "nœuds",
+                    "processeur", "cpu", "consommation", "ressources"
+                ],
+                "metrics": ["cpu_usage", "ram_usage"],
+                "weights": {"cpu_usage": 0.5, "ram_usage": 0.5},
+                "percentile": 25
+            },
+            "edge_critical": {
+                "keywords": [
+                    "edge", "proximité", "critiques", "utilisateurs",
+                    "sensibles", "temps réel", "iot", "capteurs"
+                ],
+                "metrics": ["latency"],
+                "weights": {"latency": 1.0},
+                "percentile": 10
+            },
+            "stability": {
+                "keywords": [
+                    "stabilité", "stable", "continuité", "qualité",
+                    "constante", "fiable", "fiabilité", "robuste"
+                ],
+                "metrics": ["latency", "cpu_usage", "ram_usage"],
+                "weights": {
+                    "latency": 0.34,
+                    "cpu_usage": 0.33,
+                    "ram_usage": 0.33
+                },
+                "percentile": 30
+            }
+        }
+
+        def __init__(self, config: Config):
+            self.config = config
+
+        def detect_profile(self, text: str) -> str:
+            """Analyzes the text to identify the most relevant semantic profile.
+            
+            Args:
+                text: User intention text.
+                
+            Returns:
+                The name of the detected profile or 'default'.
+            """
+            normalized = self._normalize_text(text)
+            counts = {profile: 0 for profile in self.VOCABULARY}
+            
+            for profile, data in self.VOCABULARY.items():
+                for kw in data["keywords"]:
+                    if kw in normalized:
+                        counts[profile] += 1
+            
+            best_profile = max(counts, key=counts.get)
+            return best_profile if counts[best_profile] > 0 else "default"
+
+        def build_slos(self, profile: str, hub: IntentHandler) -> List[Dict]:
+            """Constructs SLOs based on the detected profile and historical data.
+            
+            Args:
+                profile: The detected semantic profile.
+                hub: Hub interface to fetch percentiles.
+                
+            Returns:
+                List of enriched SLO dictionaries.
+            """
+            slos = []
+            if profile == "default":
+                # Fallback to Config defaults for all 3 metrics
+                raw_slos = [
+                    {"metric": "latency", "operator": "<", "threshold": self.config.DEFAULT_LATENCY_THRESHOLD, "unit": "ms", "weight": 0.34},
+                    {"metric": "cpu_usage", "operator": "<", "threshold": self.config.DEFAULT_CPU_THRESHOLD, "unit": "%", "weight": 0.33},
+                    {"metric": "ram_usage", "operator": "<", "threshold": self.config.DEFAULT_RAM_THRESHOLD, "unit": "%", "weight": 0.33}
+                ]
+            else:
+                data = self.VOCABULARY[profile]
+                for metric in data["metrics"]:
+                    p_val = hub.get_metric_percentile(metric, data["percentile"], 3600)
+                    
+                    if p_val is None:
+                        # Fallback to Config thresholds
+                        if metric == "latency":
+                            p_val = self.config.DEFAULT_LATENCY_THRESHOLD
+                        elif metric == "cpu_usage":
+                            p_val = self.config.DEFAULT_CPU_THRESHOLD
+                        else:
+                            p_val = self.config.DEFAULT_RAM_THRESHOLD
+                            
+                    slos.append({
+                        "metric": metric,
+                        "operator": "<",
+                        "threshold": p_val,
+                        "unit": "ms" if metric == "latency" else "%",
+                        "weight": data["weights"].get(metric, 0.0)
+                    })
+                raw_slos = slos
+
+            # Use the outer class method via the instance if needed, 
+            # but _enrich_slo_schema is available in IntentManagerSpoke.
+            # Here we assume this is called within IntentManagerSpoke context.
+            return raw_slos
+
+        def _normalize_text(self, text: str) -> str:
+            """Lowercases and removes accents from text."""
+            text = text.lower()
+            return "".join(
+                c for c in unicodedata.normalize('NFD', text)
+                if unicodedata.category(c) != 'Mn'
+            )
+
+    def _build_system_prompt(self, context: str) -> str:
+        """Construit le prompt système expert pour le LLM avec règles d'inférence et exemples few-shot.
+        
+        Args:
+            context: Le contexte textuel généré par le RAGContextBuilder.
+            
+        Returns:
+            Le prompt système complet.
+        """
+        return (
+            "Tu es un expert SLO pour systèmes distribués.\n"
+            "Tu DOIS répondre UNIQUEMENT avec un JSON array. Aucun texte avant ou après le JSON.\n\n"
+            "Chaque objet JSON contient exactement :\n"
+            "{\n"
+            "  \"metric\": \"latency\"|\"cpu_usage\"|\"ram_usage\",\n"
+            "  \"operator\": \"<\"|\"<=\"|\">\"|\">=\",\n"
+            "  \"threshold\": <float>,\n"
+            "  \"unit\": \"ms\"|\"%\",\n"
+            "  \"weight\": <float entre 0.0 et 1.0>\n"
+            "}\n"
+            "Somme des weights DOIT être 1.0.\n\n"
+            "Règle d'inférence :\n"
+            "Si l'intention ne contient pas de chiffres :\n"
+            "→ Utilise les valeurs P25 du contexte comme seuils\n"
+            "→ Si P25 non disponible : utilise les valeurs actuelles des VMs réduites de 20%\n"
+            "→ Priorise les métriques selon le vocabulaire :\n"
+            "  \"rapide/réactif/délai\" → latency en priorité\n"
+            "  \"charge/surcharge/CPU\" → cpu_usage en priorité\n"
+            "  \"mémoire/RAM\"          → ram_usage en priorité\n"
+            "  intention générale     → toutes métriques\n\n"
+            "Exemple 1 — Intention abstraite :\n"
+            "Contexte : RTT moyen=38ms, P25 latency=24ms, CPU moyen=58%, P25 cpu=45%\n"
+            "Intention : \"Je veux éviter les ralentissements\"\n"
+            "Réponse : [{\"metric\":\"latency\",\"operator\":\"<\",\"threshold\":24,\"unit\":\"ms\",\"weight\":0.7},{\"metric\":\"cpu_usage\",\"operator\":\"<\",\"threshold\":45,\"unit\":\"%\",\"weight\":0.3}]\n\n"
+            "Exemple 2 — Intention numérique :\n"
+            "Contexte : (quelconque)\n"
+            "Intention : \"latence < 15ms et CPU < 60%\"\n"
+            "Réponse : [{\"metric\":\"latency\",\"operator\":\"<\",\"threshold\":15,\"unit\":\"ms\",\"weight\":0.5},{\"metric\":\"cpu_usage\",\"operator\":\"<\",\"threshold\":60,\"unit\":\"%\",\"weight\":0.5}]\n\n"
+            "Exemple 3 — Intention mixte :\n"
+            "Contexte : P25 ram=51%\n"
+            "Intention : \"CPU < 70% et garde la RAM stable\"\n"
+            "Réponse : [{\"metric\":\"cpu_usage\",\"operator\":\"<\",\"threshold\":70,\"unit\":\"%\",\"weight\":0.6},{\"metric\":\"ram_usage\",\"operator\":\"<\",\"threshold\":51,\"unit\":\"%\",\"weight\":0.4}]\n\n"
+            f"Contexte système actuel :\n{context}"
+        )
+
     def query_intent_engine(self, text: str) -> tuple[List[Dict], bool]:
-        """Queries Ollama LLM to parse SLOs from user text."""
+        """Queries Ollama LLM to parse SLOs from user text with RAG context and validation."""
+        success = False
+        raw_slos = []
+
         try:
+            # Build RAG Context through the Hub
+            builder = self._RAGContextBuilder(self.config, self.core, self.slos_ref)
+            context = builder.build_context()
+
             payload = {
                 "model": "qwen2.5",
                 "messages": [
                     {
                         "role": "system",
-                        "content": (
-                            "You are an assistant that MUST respond with ONLY a JSON array and nothing else. "
-                            "Extract numeric threshold values directly from the user's intention text. "
-                            "Only include SLO objects for metrics explicitly mentioned. "
-                            "Keys: metric, operator, threshold, unit, weight. "
-                            "Weight is float (0.0-1.0), sum MUST be 1.0. "
-                            "Metrics: \"latency\", \"cpu_usage\", \"ram_usage\". "
-                            "Example: [{\"metric\":\"latency\",\"operator\":\"<\",\"threshold\":20,\"unit\":\"ms\",\"weight\":1.0}]"
-                        )
+                        "content": self._build_system_prompt(context)
                     },
                     {"role": "user", "content": text}
                 ],
@@ -260,10 +596,63 @@ class IntentManagerSpoke:
             }
             resp = requests.post(self.config.INTENT_ENGINE_URL, json=payload, timeout=90)
             llm_text = resp.json().get("message", {}).get("content", "").lower()
-            return self._parse_slos_from_text(llm_text)
+            
+            raw_slos, success = self._parse_slos_from_text(llm_text)
         except Exception as e:
-            logger.warning(f"[Intent] LLM Error: {e}. Falling back to regex.")
-            return self._parse_slos_from_text(text)
+            logger.warning(f"[Intent] LLM Error: {e}. Falling back to smart matching.")
+            success = False
+            raw_slos = []
+
+        # Hors du try/except — toujours exécuté si le LLM a échoué ou retourné du JSON invalide
+        if not success:
+            # Niveau 2 : Regex sur le texte original
+            raw_slos, regex_success = self._parse_slos_from_text(text)
+            
+            if not regex_success:
+                # Niveau 3 : Keywords Matcher
+                logger.info("[Intent] Keywords Matcher activé")
+                matcher = self._KeywordsMatcher(self.config)
+                profile = matcher.detect_profile(text)
+                logger.info(f"[Intent] Profil détecté : {profile}")
+                raw_slos = [
+                    self._enrich_slo_schema(s) 
+                    for s in matcher.build_slos(profile, self.core)
+                ]
+
+        # Validation commune — toujours exécutée
+        validator = self._SLOCoherenceValidator()
+        result = validator.validate(raw_slos)
+        
+        for err in result.errors:
+            logger.warning(f"[Intent] Erreur de cohérence : {err}")
+        for warn in result.warnings:
+            logger.warning(f"[Intent] Validation : {warn}")
+            
+        if not result.is_valid:
+            logger.critical("[Intent] SLOs invalides — aucun SLO valide extrait")
+            return [], False
+            
+        return result.corrected_slos, True
+
+    def _enrich_slo_schema(self, slo: Dict) -> Dict:
+        """Enriches an SLO object with OpenSLO-inspired fields if missing.
+        
+        Args:
+            slo: Dictionary representing a raw SLO.
+            
+        Returns:
+            The enriched SLO dictionary.
+        """
+        defaults = {
+            "target": 0.99,
+            "window": "5m",
+            "budget_remaining": 100.0,
+            "violations": 0
+        }
+        for key, val in defaults.items():
+            if key not in slo:
+                slo[key] = val
+        return slo
 
     def _parse_slos_from_text(self, text: str) -> tuple[List[Dict], bool]:
         """Parses JSON or uses regex fallback to extract SLO objects."""
@@ -273,7 +662,7 @@ class IntentManagerSpoke:
             if start != -1 and end != -1:
                 slos = json.loads(text[start:end+1])
                 if isinstance(slos, list) and slos:
-                    return slos, True
+                    return [self._enrich_slo_schema(s) for s in slos], True
         except (ValueError, json.JSONDecodeError):
             pass
 
@@ -294,19 +683,133 @@ class IntentManagerSpoke:
             w = round(1.0 / len(slos), 2)
             for s in slos: s["weight"] = w
             slos[-1]["weight"] = round(1.0 - sum(s["weight"] for s in slos[:-1]), 2)
-            return slos, True
+            return [self._enrich_slo_schema(s) for s in slos], True
 
         # Absolute Fallback
-        return [
+        raw_fallback = [
             {"metric": "latency", "operator": "<", "threshold": 50, "unit": "ms", "weight": 0.34},
             {"metric": "cpu_usage", "operator": "<", "threshold": 75, "unit": "%", "weight": 0.33},
             {"metric": "ram_usage", "operator": "<", "threshold": 80, "unit": "%", "weight": 0.33}
-        ], False
+        ]
+        return [self._enrich_slo_schema(s) for s in raw_fallback], False
 
 class MetricsManagerSpoke:
-    """Determines which physical metrics are needed based on active SLOs."""
-    def analyze_needed_metrics(self, slos: List[Dict]) -> List[str]:
-        return list(set(slo["metric"] for slo in slos if slo["metric"] in ["cpu_usage", "ram_usage"]))
+    """Intelligently determines which physical metrics are needed using Mutual Information (MI)."""
+    
+    METRICS = ["latency", "cpu_usage", "ram_usage"]
+    MI_THRESHOLD = 0.05   # Minimum score to consider a metric relevant
+    MIN_POINTS = 5        # Minimum points needed to activate MI scoring
+
+    def analyze_needed_metrics(self, slos: List[Dict], hub: Optional[IntentHandler] = None, window_seconds: int = 300) -> tuple[List[str], Dict[str, float]]:
+        """Identifies metrics to collect by combining SLO requirements and MI-based relevance.
+        
+        Args:
+            slos: Active SLOs.
+            hub: Hub interface to fetch data for MI.
+            window_seconds: Lookback window for MI calculation.
+            
+        Returns:
+            A tuple (sorted_list_of_metrics, mi_scores_dict).
+        """
+        # 1. Fallback statique (métriques explicitement dans les SLOs)
+        static_metrics = set(slo["metric"] for slo in slos if slo["metric"] in ["cpu_usage", "ram_usage"])
+        
+        if hub is None:
+            return (sorted(list(static_metrics)), {})
+
+        # 2. MI Scoring
+        data = hub.get_metrics_for_mi(window_seconds)
+        if len(data) < self.MIN_POINTS:
+            return (sorted(list(static_metrics)), {})
+
+        scores = self.compute_mi_scores(data)
+        logger.info(f"[MetricsManager] MI Scores: { {m: round(s, 3) for m, s in scores.items()} }")
+        
+        # 3. Sélection intelligente (scores >= seuil)
+        intelligent_metrics = set(m for m, s in scores.items() if s >= self.MI_THRESHOLD and m in ["cpu_usage", "ram_usage"])
+        
+        # 4. Union des deux approches
+        final_metrics = static_metrics.union(intelligent_metrics)
+        return (sorted(list(final_metrics)), scores)
+
+    def compute_mi_scores(self, data: List[Dict]) -> Dict[str, float]:
+        """Calculates normalized Mutual Information for each metric against is_violation.
+        
+        Args:
+            data: List of dictionaries containing metrics and is_violation.
+            
+        Returns:
+            Dictionary mapping metric names to their MI scores [0, 1].
+        """
+        scores = {}
+        y_vals = [int(row["is_violation"]) for row in data if row.get("is_violation") is not None]
+        
+        if not y_vals or len(set(y_vals)) < 2:
+            return {m: 0.0 for m in self.METRICS}
+
+        for metric in self.METRICS:
+            col = "rtt_ms" if metric == "latency" else metric
+            x_vals = [row.get(col) for row in data if row.get(col) is not None]
+            
+            if len(x_vals) < self.MIN_POINTS:
+                scores[metric] = 0.0
+            else:
+                # Aligner X et Y sur les indices valides (cas où certains points manqueraient)
+                # Dans notre cas, save_metrics écrit tout le bloc, mais soyons prudents.
+                valid_pairs = [(row.get(col), int(row["is_violation"])) 
+                              for row in data 
+                              if row.get(col) is not None and row.get("is_violation") is not None]
+                
+                if len(valid_pairs) < self.MIN_POINTS:
+                    scores[metric] = 0.0
+                else:
+                    x_clean = [p[0] for p in valid_pairs]
+                    y_clean = [p[1] for p in valid_pairs]
+                    scores[metric] = self._compute_mi(x_clean, y_clean)
+        
+        return scores
+
+    def _compute_mi(self, x_vals: List[float], y_vals: List[int]) -> float:
+        """Core MI calculation logic with median discretization and normalization."""
+        n = len(x_vals)
+        if n == 0: return 0.0
+        
+        # 1. Discrétisation de X par la médiane
+        sorted_x = sorted(x_vals)
+        mid = n // 2
+        median = sorted_x[mid] if n % 2 != 0 else (sorted_x[mid-1] + sorted_x[mid]) / 2.0
+        
+        x_bins = [1 if x > median else 0 for x in x_vals]
+        
+        # 2. Table de contingence 2x2
+        # p(x,y)
+        counts = {(0,0): 0, (0,1): 0, (1,0): 0, (1,1): 0}
+        for xb, yb in zip(x_bins, y_vals):
+            counts[(xb, yb)] += 1
+            
+        # 3. Probabilités marginales et conjointes
+        px = {0: x_bins.count(0) / n, 1: x_bins.count(1) / n}
+        py = {0: y_vals.count(0) / n, 1: y_vals.count(1) / n}
+        pxy = {k: v / n for k, v in counts.items()}
+        
+        # 4. Calcul MI
+        mi = 0.0
+        for (xb, yb), p_joint in pxy.items():
+            if p_joint > 0:
+                p_prod = px[xb] * py[yb]
+                if p_prod > 0:
+                    mi += p_joint * math.log2(p_joint / p_prod)
+        
+        # 5. Normalisation par entropie maximale
+        hx = self._entropy(list(px.values()))
+        hy = self._entropy(list(py.values()))
+        
+        denom = max(hx, hy)
+        return mi / denom if denom > 0 else 0.0
+
+    def _entropy(self, probs: List[float]) -> float:
+        """Calculates Shannon entropy."""
+        return -sum(p * math.log2(p) for p in probs if p > 0)
 
 class CollectorSpoke:
     """Fetches real-time physical metrics (CPU/RAM) from VM simulators."""
@@ -319,15 +822,20 @@ class CollectorSpoke:
             port = self.config.VM_PORTS.get(vm_id)
             resp = requests.get(f"http://localhost:{port}/metrics", timeout=1.5)
             data = resp.json()
-            return {"vm_id": vm_id, "cpu_usage": data["cpu_usage"], "ram_usage": data["ram_usage"]}
+            return {
+                "vm_id": vm_id, 
+                "cpu_usage": data["cpu_usage"], 
+                "ram_usage": data["ram_usage"],
+                "is_active_service": data.get("is_active_service", False)
+            }
         except Exception:
             # Fallback to simulation if VM is unreachable
             return {
-                "vm_id": vm_id, 
-                "cpu_usage": random.uniform(20, 95), 
-                "ram_usage": random.uniform(30, 90)
+                "vm_id": vm_id,
+                "cpu_usage": random.uniform(20, 95),
+                "ram_usage": random.uniform(30, 90),
+                "is_active_service": False
             }
-
 class MLPredictorSpoke:
     """Handles communication with specialized Machine Learning prediction APIs."""
     def __init__(self, config: Config): 
@@ -403,8 +911,44 @@ class DecisionIntelligenceSpoke:
             return {"decision": "migrate", "from_vm": service_vm, "to_vm": best["vm_id"], "reason": reason}
         return {"decision": "stay", "reason": "Nominal"}
 
+    def _compute_vm_score(self, target: Dict, predictions_map: Dict, slos: List[Dict], weights: Dict[str, float]) -> float:
+        """Calculates a selection score for a target VM considering predictions and budget bonus.
+        
+        Args:
+            target: Dictionary of current VM metrics.
+            predictions_map: Map of predictions for all VMs.
+            slos: List of active SLO objects with budget information.
+            weights: Weight mapping for metrics.
+            
+        Returns:
+            Final score (lower is better).
+        """
+        vm_id = target["vm_id"]
+        vm_preds = predictions_map.get(vm_id, {})
+        
+        # 1. Base prediction score (weighted mean of predicted future values)
+        score_pred = 0.0
+        for slo in slos:
+            m_name = slo["metric"]
+            preds = vm_preds.get(m_name, [])
+            score_pred += weights.get(m_name, 0.0) * calculate_weighted_mean(preds)
+        
+        # 2. Budget bonus (incentive for VMs respecting SLOs with healthy budgets)
+        budget_bonus = 0.0
+        for slo in slos:
+            m_name, threshold = slo["metric"], slo["threshold"]
+            val = target.get("rtt_ms" if m_name == "latency" else m_name)
+            
+            # Bonus if current value respects SLO
+            if val is not None and val <= threshold:
+                bonus = slo.get("weight", 0.0) * (slo.get("budget_remaining", 100.0) / 100.0)
+                budget_bonus += bonus
+        
+        # 3. Final score: pred - budget_bonus (capped bonus at 1.0)
+        return score_pred - min(budget_bonus, 1.0)
+
     def evaluate_enhanced_decision(self, current_data: List[Dict], predictions_map: Dict[str, Dict[str, List[float]]], slos: List[Dict], service_vm=None) -> Dict:
-        """Intention-based decision using multi-criteria weighted scoring with severity prioritization."""
+        """Intention-based decision using multi-criteria weighted scoring with severity prioritization and budget awareness."""
         weights = {m: 0.0 for m in ["latency", "cpu_usage", "ram_usage"]}
         for s in slos: weights[s["metric"]] = s.get("weight", 0.0)
 
@@ -458,11 +1002,8 @@ class DecisionIntelligenceSpoke:
             )]
             
             final_pool = valid if valid else targets
-            best = min(final_pool, key=lambda t: (
-                weights["latency"] * calculate_weighted_mean(predictions_map.get(t["vm_id"], {}).get("latency", [])) +
-                weights["cpu_usage"] * calculate_weighted_mean(predictions_map.get(t["vm_id"], {}).get("cpu_usage", [])) +
-                weights["ram_usage"] * calculate_weighted_mean(predictions_map.get(t["vm_id"], {}).get("ram_usage", []))
-            ))
+            # Use budget-aware scoring
+            best = min(final_pool, key=lambda t: self._compute_vm_score(t, predictions_map, slos, weights))
             
             reason = f"{worst_vm} {worst['metric']} {worst['val']:.1f} > SLO {worst['threshold']} (Sévérité: {worst['severity']:.2f})"
             return {"decision": "migrate", "from_vm": worst_vm, "to_vm": best["vm_id"], "reason": reason}
@@ -478,22 +1019,186 @@ class DatabaseSpoke:
         with sqlite3.connect(self.config.DB_NAME) as conn:
             conn.execute("CREATE TABLE IF NOT EXISTS metrics (id INTEGER PRIMARY KEY, vm_id TEXT, rtt_ms REAL, cpu_usage REAL, ram_usage REAL, mode TEXT, timestamp TEXT)")
             conn.execute("CREATE TABLE IF NOT EXISTS decisions (id INTEGER PRIMARY KEY, decision TEXT, from_vm TEXT, to_vm TEXT, reason TEXT, mode TEXT, master_ack INTEGER, timestamp TEXT)")
+            # Migration douce pour budget_remaining
+            try:
+                conn.execute("ALTER TABLE decisions ADD COLUMN budget_remaining REAL")
+            except sqlite3.OperationalError:
+                pass # Colonne déjà existante
+            
+            # Migration douce pour is_violation
+            try:
+                conn.execute("ALTER TABLE metrics ADD COLUMN is_violation INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass # Colonne déjà existante
 
     @safe_call(None, "DatabaseSpoke.save_metrics")
-    def save_metrics(self, measurements: List[Dict], mode: str):
+    def save_metrics(self, measurements: List[Dict], mode: str, slos: List[Dict] = []):
+        """Saves a batch of VM metrics to SQLite, identifying violations in real-time.
+        
+        Args:
+            measurements: List of metric dictionaries.
+            mode: The orchestrator mode (classic/enhanced).
+            slos: Active SLOs to check for violations.
+        """
         ts = datetime.now(timezone.utc).isoformat()
         with sqlite3.connect(self.config.DB_NAME) as conn:
             for m in measurements:
-                conn.execute("INSERT INTO metrics (vm_id, rtt_ms, cpu_usage, ram_usage, mode, timestamp) VALUES (?, ?, ?, ?, ?, ?)", 
-                             (m["vm_id"], m.get("rtt_ms", 0), m.get("cpu_usage", 0), m.get("ram_usage", 0), mode, ts))
+                is_violation = 0
+                for slo in slos:
+                    col = "rtt_ms" if slo["metric"] == "latency" else slo["metric"]
+                    val = m.get(col)
+                    if val is not None and val > slo["threshold"]:
+                        is_violation = 1
+                        break
+                
+                conn.execute(
+                    "INSERT INTO metrics (vm_id, rtt_ms, cpu_usage, ram_usage, mode, is_violation, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)", 
+                    (m["vm_id"], m.get("rtt_ms", 0), m.get("cpu_usage", 0), m.get("ram_usage", 0), mode, is_violation, ts)
+                )
 
     @safe_call(False, "DatabaseSpoke.save_decision")
     def save_decision(self, dec: Dict, mode: str, ack: bool):
         ts = datetime.now(timezone.utc).isoformat()
         with sqlite3.connect(self.config.DB_NAME) as conn:
-            conn.execute("INSERT INTO decisions (decision, from_vm, to_vm, reason, mode, master_ack, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)", 
-                         (dec["decision"], dec.get("from_vm"), dec.get("to_vm"), dec["reason"], mode, 1 if ack else 0, ts))
+            conn.execute("INSERT INTO decisions (decision, from_vm, to_vm, reason, mode, master_ack, budget_remaining, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", 
+                         (dec["decision"], dec.get("from_vm"), dec.get("to_vm"), dec["reason"], mode, 1 if ack else 0, dec.get("budget_remaining", 100.0), ts))
         return True
+
+    def get_slo_violations(self, metric: str, threshold: float, operator: str, window_seconds: int) -> int:
+        """Counts metrics rows where the value exceeds the SLO threshold within a window.
+        
+        Args:
+            metric: The metric name (latency, cpu_usage, ram_usage).
+            threshold: The numeric threshold.
+            operator: The comparison operator from the SLO (<, <=, >, >=).
+            window_seconds: The lookback window in seconds.
+            
+        Returns:
+            The count of violations.
+        """
+        try:
+            col = "rtt_ms" if metric == "latency" else metric
+            cutoff = (datetime.now(timezone.utc) - timedelta(seconds=window_seconds)).isoformat()
+            
+            # Déterminer la condition de violation (l'inverse de l'opérateur SLO)
+            # Si SLO est 'val < threshold', violation est 'val >= threshold'
+            op_map = {"<": ">=", "<=": ">", ">": "<=", ">=": "<"}
+            sql_op = op_map.get(operator, ">")
+            
+            with sqlite3.connect(self.config.DB_NAME) as conn:
+                cur = conn.execute(
+                    f"SELECT COUNT(*) FROM metrics WHERE {col} {sql_op} ? AND timestamp > ?",
+                    (threshold, cutoff)
+                )
+                return cur.fetchone()[0]
+        except Exception as e:
+            logger.error(f"[Database] Error counting violations for {metric}: {e}")
+            return 0
+
+    def get_window_count(self, window_seconds: int) -> int:
+        """Returns the total number of metric entries in the given window.
+        
+        Args:
+            window_seconds: The lookback window in seconds.
+            
+        Returns:
+            The count of points.
+        """
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(seconds=window_seconds)).isoformat()
+            with sqlite3.connect(self.config.DB_NAME) as conn:
+                cur = conn.execute("SELECT COUNT(*) FROM metrics WHERE timestamp > ?", (cutoff,))
+                return cur.fetchone()[0]
+        except Exception as e:
+            logger.error(f"[Database] Error counting window points: {e}")
+            return 0
+
+    def get_metrics_with_violations(self, window_seconds: int) -> List[Dict]:
+        """Retrieves metrics and violation status for Mutual Information calculation.
+        
+        Args:
+            window_seconds: Lookback window in seconds.
+            
+        Returns:
+            List of dictionaries containing metrics and is_violation flag.
+        """
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(seconds=window_seconds)).isoformat()
+            with sqlite3.connect(self.config.DB_NAME) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.execute(
+                    "SELECT vm_id, rtt_ms, cpu_usage, ram_usage, is_violation, timestamp FROM metrics "
+                    "WHERE timestamp > ? ORDER BY timestamp DESC",
+                    (cutoff,)
+                )
+                return [dict(row) for row in cur.fetchall()]
+        except Exception as e:
+            logger.error(f"[Database] Error fetching metrics for MI: {e}")
+            return []
+
+    def get_recent_metrics(self, window_seconds: int) -> List[Dict]:
+        """Retrieves metrics from the last window_seconds for RAG context.
+        
+        Args:
+            window_seconds: Time window in seconds to look back.
+            
+        Returns:
+            List of dictionaries containing VM metrics and timestamps.
+        """
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(seconds=window_seconds)).isoformat()
+            with sqlite3.connect(self.config.DB_NAME) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.execute(
+                    "SELECT vm_id, rtt_ms, cpu_usage, ram_usage, timestamp FROM metrics "
+                    "WHERE timestamp > ? ORDER BY timestamp DESC", 
+                    (cutoff,)
+                )
+                return [dict(row) for row in cur.fetchall()]
+        except Exception as e:
+            logger.error(f"[Database] Error fetching recent metrics: {e}")
+            return []
+
+    def get_historical_percentiles(self, metric: str, percentile: float, window_seconds: int = 3600) -> Optional[float]:
+        """Calculates a specific percentile for a metric over a historical window.
+        
+        Args:
+            metric: The metric name (latency, cpu_usage, ram_usage).
+            percentile: The percentile to calculate (0-100).
+            window_seconds: Lookback window in seconds.
+            
+        Returns:
+            The calculated percentile value or None if insufficient data.
+        """
+        try:
+            col = "rtt_ms" if metric == "latency" else metric
+            cutoff = (datetime.now(timezone.utc) - timedelta(seconds=window_seconds)).isoformat()
+            
+            with sqlite3.connect(self.config.DB_NAME) as conn:
+                cur = conn.execute(
+                    f"SELECT {col} FROM metrics WHERE timestamp > ? AND {col} IS NOT NULL",
+                    (cutoff,)
+                )
+                values = [row[0] for row in cur.fetchall()]
+            
+            if len(values) < 10:
+                return None
+                
+            values.sort()
+            n = len(values)
+            index = (percentile / 100.0) * (n - 1)
+            
+            if index.is_integer():
+                return round(values[int(index)], 2)
+            else:
+                lower = int(index)
+                upper = lower + 1
+                weight = index - lower
+                return round(values[lower] + weight * (values[upper] - values[lower]), 2)
+                
+        except Exception as e:
+            logger.error(f"[Database] Error calculating percentile for {metric}: {e}")
+            return None
 
 class HistoryLoaderSpoke:
     """Loads historical data windows for ML prediction input."""
@@ -517,12 +1222,13 @@ class ObservabilitySpoke:
 
     def update_decision(self, dec: Dict, current_vm: str = None):
         self.last_decision = dec
-        if dec["decision"] == "migrate":
-            self.current_service_vm = dec["to_vm"]
-        elif current_vm and self.current_service_vm is None:
-            self.current_service_vm = current_vm
 
     def update_data(self, current_data: List[Dict]):
+        # Découverte dynamique de la VM active
+        active_vm = next((e["vm_id"] for e in current_data if e.get("is_active_service")), None)
+        if active_vm:
+            self.current_service_vm = active_vm
+
         for entry in current_data:
             vm = entry["vm_id"]
             for key, m in [("rtt", "rtt_ms"), ("cpu", "cpu_usage"), ("ram", "ram_usage")]:
@@ -598,17 +1304,54 @@ class OrchestratorCore:
         self.ml = MLPredictorSpoke(config)
         self.decision_engine = DecisionIntelligenceSpoke(config)
         self.viz = ObservabilitySpoke(config)
-        self.intent_mgr = IntentManagerSpoke(config, self)
+        
+        self.mode = "autonomous"
+        self.current_slos = [
+            {
+                "metric": "latency",
+                "operator": "<",
+                "threshold": config.DEFAULT_LATENCY_THRESHOLD,
+                "unit": "ms",
+                "weight": 0.34,
+                "target": 0.99,
+                "window": "5m",
+                "budget_remaining": 100.0,
+                "violations": 0
+            },
+            {
+                "metric": "cpu_usage", 
+                "operator": "<",
+                "threshold": config.DEFAULT_CPU_THRESHOLD,
+                "unit": "%",
+                "weight": 0.33,
+                "target": 0.99,
+                "window": "5m",
+                "budget_remaining": 100.0,
+                "violations": 0
+            },
+            {
+                "metric": "ram_usage",
+                "operator": "<", 
+                "threshold": config.DEFAULT_RAM_THRESHOLD,
+                "unit": "%",
+                "weight": 0.33,
+                "target": 0.99,
+                "window": "5m",
+                "budget_remaining": 100.0,
+                "violations": 0
+            }
+        ]
+        self.last_real_data_ts = None
+        self.last_migration_ts = None
+        self._last_known_active_vm: Optional[str] = None
+        self.last_mi_scores: Dict[str, float] = {}
+        
+        self.intent_mgr = IntentManagerSpoke(config, self, config.DB_NAME, self.current_slos)
         self.metrics_mgr = MetricsManagerSpoke()
         self.collector = CollectorSpoke(config)
         self.latency_mgr = LatencyManagerSpoke(config, self)
         self._lock = threading.RLock()
         
-        self.mode = "classic"
-        self.current_slos = []
-        self.last_real_data_ts = None
-        self.last_migration_ts = None
-        self.service_vm = None  # VM qui héberge le service
         self.start_ts = time.time()
         self.app = Flask(f"{__name__}_core")
         self._setup_routes()
@@ -617,62 +1360,136 @@ class OrchestratorCore:
         @self.app.route('/status', methods=['GET'])
         def get_status():
             return jsonify({
-                "mode": self.mode, "uptime": int(time.time() - self.start_ts), 
+                "mode": self.mode, 
+                "uptime": int(time.time() - self.start_ts), 
                 "slos": self.current_slos,
-                "service_vm": self.service_vm
+                "service_vm": self._last_known_active_vm,
+                "mi_scores": self.last_mi_scores
             }), 200
+
+    def _find_active_vm(self, enriched: List[Dict]) -> Optional[str]:
+        """Retourne le vm_id de la VM active dans le payload courant."""
+        for e in enriched:
+            if e.get("is_active_service"):
+                return e["vm_id"]
+        return None
+
+    def get_recent_context(self, window_seconds: int) -> List[Dict]:
+        """Hub method to provide RAG context without direct spoke-to-spoke access."""
+        return self.db.get_recent_metrics(window_seconds)
+
+    def get_metric_percentile(self, metric: str, percentile: float, window_seconds: int = 3600) -> Optional[float]:
+        """Hub method to calculate historical percentiles via the database spoke.
+        
+        Args:
+            metric: The metric name (latency, cpu_usage, ram_usage).
+            percentile: The percentile to calculate (0-100).
+            window_seconds: Lookback window in seconds.
+            
+        Returns:
+            The calculated percentile value or None.
+        """
+        return self.db.get_historical_percentiles(metric, percentile, window_seconds)
+
+    def get_metrics_for_mi(self, window_seconds: int = 300) -> List[Dict]:
+        """Hub method to retrieve metrics and violations for MI scoring.
+        
+        Args:
+            window_seconds: Lookback window in seconds.
+            
+        Returns:
+            List of dictionaries containing metrics and is_violation flag.
+        """
+        return self.db.get_metrics_with_violations(window_seconds)
 
     def set_user_intent(self, text: str):
         slos, success = self.intent_mgr.query_intent_engine(text)
         
+        if not success or not slos:
+            logger.critical(f"{Fore.RED}Intention rejetée — Aucun SLO valide extrait ou échec LLM. État inchangé.")
+            return
+
         total_weight = sum(s.get("weight", 0) for s in slos)
         if total_weight > 0 and abs(total_weight - 1.0) > 0.01:
             for s in slos:
                 s["weight"] = round(s.get("weight", 0) / total_weight, 3)
                 
-        if not success:
-            logger.critical(f"{Fore.RED}LLM timeout — SLOs non extraits. Renvoie ton intention.")
-            return
-
         with self._lock:
             self.current_slos = slos
             self.viz.current_slos = slos
             self.mode = "enhanced"
+        
+        self._refresh_slo_budgets()
         logger.info(f"[Core] Enhanced Mode Enabled. SLOs: {slos}")
 
     def set_last_real_data_ts(self, ts: float) -> None:
         with self._lock:
             self.last_real_data_ts = ts
 
+    def _is_budget_exhausted(self) -> bool:
+        """Checks if any active SLO has a remaining budget of 0%."""
+        if not self.current_slos:
+            return False
+        with self._lock:
+            return any(slo.get("budget_remaining") == 0.0 for slo in self.current_slos)
+
     def _check_cooldown(self) -> Optional[Dict]:
         with self._lock:
             if self.last_migration_ts and (time.time() - self.last_migration_ts < self.config.COOLDOWN_SECONDS):
+                # Check for Budget Exhaustion Override (Enhanced Mode only)
+                if self.mode == "enhanced" and self._is_budget_exhausted():
+                    logger.critical(f"{Fore.RED}{Style.BRIGHT}⚠️ BUDGET ÉPUISÉ — Override cooldown")
+                    return None
+                    
                 rem = int(self.config.COOLDOWN_SECONDS - (time.time() - self.last_migration_ts))
                 logger.info(f"{Fore.YELLOW}⏳ COOLDOWN ACTIF — Prochaine évaluation dans {rem}s")
                 return {"decision": "stay", "reason": "Cooldown actif"}
         return None
 
-    def _filter_active_metrics(self, collected: Dict, active_metrics: List[str]) -> Dict:
+    def _filter_active_metrics(self, collected: Dict, active_metrics: List[str], fallback_vm_id: str) -> Dict:
         if not collected or "vm_id" not in collected:
-            return {}
+            return {"vm_id": fallback_vm_id}
         res = {"vm_id": collected["vm_id"]}
         for m in ["cpu_usage", "ram_usage"]:
             if m in active_metrics and m in collected:
                 res[m] = collected[m]
         return res
 
-    def run_classic_flow(self, measurements: List[Dict]) -> Dict:
-        """Executes the standard 7-step network-centric migration flow."""
-        self._print_cycle_header()
+    def _refresh_slo_budgets(self):
+        """Updates violations and budget_remaining for all active SLOs using historical data."""
+        if not self.current_slos:
+            return
+
+        window_seconds = 300 # 5m par défaut
+        total_points = self.db.get_window_count(window_seconds)
         
         with self._lock:
-            if self.service_vm is None and measurements:
-                self.service_vm = min(measurements, key=lambda x: x["rtt_ms"])["vm_id"]
-                logger.info(f"[Core] Service initialisé sur {self.service_vm} (meilleur RTT du premier cycle)")
+            for slo in self.current_slos:
+                violations = self.db.get_slo_violations(
+                    slo["metric"], slo["threshold"], slo["operator"], window_seconds
+                )
+                slo["violations"] = violations
+                
+                if total_points > 0:
+                    budget = 100.0 * (1 - (violations / total_points))
+                    slo["budget_remaining"] = max(0.0, min(100.0, round(budget, 2)))
+                else:
+                    slo["budget_remaining"] = 100.0
+
+    def run_classic_flow(self, measurements: List[Dict]) -> Dict:
+        """Executes the standard 7-step network-centric migration flow. (DEPRECATED)"""
+        logger.warning("[Core] run_classic_flow() est déprécié. Utiliser run_autonomous_flow() à la place.")
+        self._print_cycle_header()
         
+        # Découverte dynamique du service
+        service_vm = self._find_active_vm(measurements)
+        if service_vm is None:
+            logger.warning("[Core] Aucune VM active détectée dans le payload classic.")
+
         # Steps 1-4: Observation & Prediction
         log_step("1. STORE METRICS", "Core -> Database", measurements)
-        self.db.save_metrics(measurements, "classic")
+        self.db.save_metrics(measurements, "classic", self.current_slos)
+        self._refresh_slo_budgets()
         
         log_step("2. LOAD HISTORY", "Core -> HistoryLoader", {"vms": self.config.VM_LIST})
         
@@ -685,7 +1502,7 @@ class OrchestratorCore:
         
         # Decision step with Cooldown
         cooldown = self._check_cooldown()
-        dec = cooldown if cooldown else self.decision_engine.evaluate_classic_decision(measurements, preds, self.service_vm)
+        dec = cooldown if cooldown else self.decision_engine.evaluate_classic_decision(measurements, preds, service_vm)
         
         log_step("6. RETOUR DÉCISION", "DecisionIntelligence -> Core", dec)
         self.viz.update_data(measurements)
@@ -694,26 +1511,86 @@ class OrchestratorCore:
         self._execute_command(dec, "classic")
         return dec
 
+    def run_autonomous_flow(self, measurements: List[Dict]) -> Dict:
+        """Executes the 8-step autonomous migration flow with default SLOs and MI scoring."""
+        self._print_cycle_header()
+        
+        # 1. Analyze Metrics (Intelligent selection)
+        log_step("1. ANALYZE METRICS", "Core -> MetricsManager", self.current_slos)
+        needed, mi_scores = self.metrics_mgr.analyze_needed_metrics(self.current_slos, hub=self, window_seconds=300)
+        active = list(set(["latency"] + needed))
+
+        with self._lock:
+            self.last_mi_scores = mi_scores
+        
+        # 2. Collect Metrics
+        log_step("2. COLLECTION REQUEST", "MetricsManager -> Collector", needed)
+        enriched = [
+            {**rm, **self._filter_active_metrics(self.collector.collect_vm_metrics(rm["vm_id"]), active, rm["vm_id"])} 
+            for rm in measurements
+        ]
+        
+        # 3. Découverte dynamique du service
+        service_vm = self._find_active_vm(enriched)
+        if service_vm is None:
+            logger.warning("[Core] Aucune VM active détectée dans le payload autonomous.")
+
+        # 4. Store Metrics & Refresh Budgets
+        log_step("3. STORE METRICS", "Collector -> Database", enriched)
+        self.db.save_metrics(enriched, "autonomous", self.current_slos)
+        self._refresh_slo_budgets()
+        
+        # 5. ML Prediction
+        log_step("4. ML PREDICTION", "Core -> MLPredictor", active)
+        preds_map = {
+            e["vm_id"]: {
+                m: self.ml.get_enhanced_prediction(m, e.get("rtt_ms" if m == "latency" else m, 0)) 
+                for m in active
+            } for e in enriched
+        }
+        self.viz.update_predictions(preds_map, mode="enhanced")
+        
+        log_step("5. RETOUR PREDICTIONS", "MLPredictor -> Core", preds_map)
+
+        # 6. Decision logic
+        log_step("6. DECISION REQUEST", "Core -> DecisionIntelligence", self.current_slos)
+        cooldown = self._check_cooldown()
+        dec = cooldown if cooldown else self.decision_engine.evaluate_enhanced_decision(
+            enriched, preds_map, self.current_slos, service_vm
+        )
+        
+        # 7. Update Observability
+        log_step("7. RETOUR DÉCISION", "DecisionIntelligence -> Core", dec)
+        self.viz.update_data(enriched)
+        
+        # 8. Execute Command
+        self._execute_command(dec, "autonomous")
+        return dec
+
     def run_enhanced_flow(self, rtt_measurements: List[Dict]) -> Dict:
         """Executes the advanced 9-step intention-centric migration flow."""
         self._print_cycle_header()
         
         # 1. Analyze
         log_step("1. ANALYZE SLOs", "Core -> MetricsManager", self.current_slos)
-        needed = self.metrics_mgr.analyze_needed_metrics(self.current_slos)
+        needed, mi_scores = self.metrics_mgr.analyze_needed_metrics(self.current_slos, hub=self, window_seconds=300)
         active = list(set(["latency"] + [s["metric"] for s in self.current_slos]))
+
+        with self._lock:
+            self.last_mi_scores = mi_scores
         
         # 2-3. Collect & Store
         log_step("2. COLLECTION REQUEST", "MetricsManager -> Collector", needed)
-        enriched = [{**rm, **self._filter_active_metrics(self.collector.collect_vm_metrics(rm["vm_id"]), active)} for rm in rtt_measurements]
+        enriched = [{**rm, **self._filter_active_metrics(self.collector.collect_vm_metrics(rm["vm_id"]), active, rm["vm_id"])} for rm in rtt_measurements]
         
-        with self._lock:
-            if self.service_vm is None and enriched:
-                self.service_vm = min(enriched, key=lambda x: x.get("rtt_ms", 999))["vm_id"]
-                logger.info(f"[Core] Service initialisé sur {self.service_vm} (meilleur RTT du premier cycle)")
+        # 3. Découverte dynamique du service
+        service_vm = self._find_active_vm(enriched)
+        if service_vm is None:
+            logger.warning("[Core] Aucune VM active détectée dans le payload enhanced.")
 
         log_step("3. STORE METRICS", "Collector -> Database", enriched)
-        self.db.save_metrics(enriched, "enhanced")
+        self.db.save_metrics(enriched, "enhanced", self.current_slos)
+        self._refresh_slo_budgets()
         
         # 4-6. ML Workflow
         log_step("4. LOAD HISTORY", "Core -> HistoryLoader", active)
@@ -726,7 +1603,7 @@ class OrchestratorCore:
         
         # Decision step with Cooldown
         cooldown = self._check_cooldown()
-        dec = cooldown if cooldown else self.decision_engine.evaluate_enhanced_decision(enriched, preds_map, self.current_slos, self.service_vm)
+        dec = cooldown if cooldown else self.decision_engine.evaluate_enhanced_decision(enriched, preds_map, self.current_slos, service_vm)
         
         log_step("8. RETOUR DÉCISION", "DecisionIntelligence -> Core", dec)
         self.viz.update_data(enriched)
@@ -737,6 +1614,13 @@ class OrchestratorCore:
 
     def _execute_command(self, dec: Dict, mode: str):
         log_step(f"9. COMMAND" if mode == "enhanced" else "7. COMMAND", "Core -> Master", dec)
+        
+        # Attacher le budget moyen à la décision pour persistance
+        if self.current_slos:
+            dec["budget_remaining"] = round(sum(s["budget_remaining"] for s in self.current_slos) / len(self.current_slos), 2)
+        else:
+            dec["budget_remaining"] = 100.0
+
         ack = self._send_to_master(dec, mode)
         self.db.save_decision(dec, mode, ack)
         
@@ -747,10 +1631,39 @@ class OrchestratorCore:
 
     def _send_to_master(self, dec: Dict, mode: str) -> bool:
         if dec["decision"] == "stay": return True
+        
+        from_vm = dec.get("from_vm")
+        to_vm = dec.get("to_vm")
+
+        # 1. Deactivate source VM
+        if from_vm:
+            try:
+                url = f"http://localhost:{self.config.VM_PORTS[from_vm]}/deactivate"
+                resp = requests.post(url, timeout=2.0)
+                if resp.status_code == 200:
+                    logger.info(f"[Core] Source {from_vm} désactivée avec succès.")
+                else:
+                    logger.warning(f"[Core] Échec désactivation source {from_vm} (status {resp.status_code}).")
+            except Exception as e:
+                logger.error(f"[Core] Erreur lors de la désactivation de {from_vm}: {e}")
+
+        # 2. Activate target VM
+        if to_vm:
+            try:
+                url = f"http://localhost:{self.config.VM_PORTS[to_vm]}/activate"
+                resp = requests.post(url, timeout=2.0)
+                if resp.status_code == 200:
+                    logger.info(f"[Core] Cible {to_vm} activée avec succès.")
+                    with self._lock:
+                        self._last_known_active_vm = to_vm
+                else:
+                    logger.warning(f"[Core] Échec activation cible {to_vm} (status {resp.status_code}).")
+            except Exception as e:
+                logger.error(f"[Core] Erreur lors de la activation de {to_vm}: {e}")
+
+        # 3. Notify Master Cloud
         with self._lock:
             self.last_migration_ts = time.time()
-            if dec.get("to_vm"):
-                self.service_vm = dec["to_vm"]
         
         self.viz.update_decision(dec)
 
