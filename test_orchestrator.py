@@ -174,6 +174,57 @@ class TestOrchestratorCore:
         # Vérifie que l'intelligence n'a même pas été appelée
         core.decision_engine.evaluate_enhanced_decision.assert_not_called()
 
+    @patch('orchestrator.logger')
+    @patch('orchestrator.DatabaseSpoke')
+    @patch('orchestrator.ObservabilitySpoke')
+    @patch('orchestrator.MLPredictorSpoke')
+    def test_classic_flow_logs_deprecation_warning(self, mock_ml, mock_viz, mock_db, mock_logger):
+        """Vérifie que run_classic_flow() produit un avertissement de dépréciation.
+        
+        Cette méthode teste que:
+        1. L'appel à run_classic_flow() déclenche un logger.warning()
+        2. Le message contient le texte attendu sur la dépréciation
+        3. run_autonomous_flow() est recommandé comme remplacement
+        """
+        from io import StringIO
+        import sys
+        
+        mock_db_instance = mock_db.return_value
+        mock_db_instance.get_window_count.return_value = 10
+        mock_db_instance.get_slo_violations.return_value = 0
+        
+        core = OrchestratorCore(Config())
+        core.db = mock_db_instance
+        
+        # Simuler des données minimales pour la méthode
+        measurements = [{"vm_id": "vm1", "rtt_ms": 20.0}]
+        
+        # Rediriger stdout pour éviter les problèmes d'encodage avec colorama
+        old_stdout = sys.stdout
+        sys.stdout = StringIO()
+        try:
+            # Appeler la méthode dépréciée
+            core.run_classic_flow(measurements)
+        finally:
+            sys.stdout = old_stdout
+        
+        # Vérifier que logger.warning a été appelé (plusieurs fois potentiellement)
+        assert mock_logger.warning.called, "logger.warning() n'a pas été appelé"
+        
+        # Chercher parmi tous les appels celui qui contient le message de dépréciation
+        deprecation_found = False
+        for call in mock_logger.warning.call_args_list:
+            call_args = call[0][0] if call[0] else ""
+            if "run_classic_flow()" in call_args and "déprécié" in call_args:
+                deprecation_found = True
+                break
+        
+        assert deprecation_found, (
+            f"Aucun appel à logger.warning() ne contient "
+            f"le message de dépréciation attendu. "
+            f"Appels: {[call[0][0] if call[0] else '' for call in mock_logger.warning.call_args_list]}"
+        )
+
 # =============================================================================
 # 5. TESTS DES SPOKES DE DONNÉES (Collectors & Predictors)
 # =============================================================================
@@ -939,6 +990,37 @@ class TestAutonomousMode:
             assert core.run_autonomous_flow.called
             assert not core.run_classic_flow.called
 
+    def test_latency_handler_protocol_no_classic(self):
+        """Vérifie que LatencyHandler Protocol n'expose pas run_classic_flow.
+        
+        Cette méthode teste que:
+        1. Le Protocol LatencyHandler a été nettoyé
+        2. run_classic_flow n'en fait plus partie du contrat
+        3. Seuls run_autonomous_flow et run_enhanced_flow sont exposés
+        """
+        import inspect
+        from typing import get_type_hints
+        
+        # Charger le Protocol
+        from orchestrator import LatencyHandler
+        
+        # Vérifier que le Protocol a les bonnes méthodes
+        protocol_attrs = set(dir(LatencyHandler))
+        
+        # run_classic_flow ne doit PAS être dans le Protocol
+        assert "run_classic_flow" not in protocol_attrs, \
+            "run_classic_flow() ne doit pas être dans LatencyHandler Protocol"
+        
+        # Les méthodes attendues DOIVENT être dans le Protocol
+        assert "run_autonomous_flow" in protocol_attrs, \
+            "run_autonomous_flow() doit être dans LatencyHandler Protocol"
+        assert "run_enhanced_flow" in protocol_attrs, \
+            "run_enhanced_flow() doit être dans LatencyHandler Protocol"
+        assert "mode" in protocol_attrs, \
+            "mode property doit être dans LatencyHandler Protocol"
+        assert "set_last_real_data_ts" in protocol_attrs, \
+            "set_last_real_data_ts() doit être dans LatencyHandler Protocol"
+
 # =============================================================================
 # 16. TESTS DE RÉGRESSION END-TO-END (Tâche 10)
 # =============================================================================
@@ -973,10 +1055,10 @@ class TestEndToEndRegression:
                 {"vm_id": "vm2", "rtt_ms": 10.0}
             ]
             # Mock du collector pour retourner les deux VMs
-            def mock_collect(vm_id):
+            def mock_collect(vm_id, history_loader=None):
                 if vm_id == "vm1":
-                    return {"vm_id": "vm1", "cpu_usage": val, "ram_usage": val, "is_active_service": True}
-                return {"vm_id": "vm2", "cpu_usage": 30.0, "ram_usage": 30.0, "is_active_service": False}
+                    return {"vm_id": "vm1", "cpu_usage": val, "ram_usage": val, "is_active_service": True, "data_source": "real", "reliability": 1.0}
+                return {"vm_id": "vm2", "cpu_usage": 30.0, "ram_usage": 30.0, "is_active_service": False, "data_source": "real", "reliability": 1.0}
             
             core.collector.collect_vm_metrics.side_effect = mock_collect
             
@@ -1611,6 +1693,714 @@ class TestFilterActiveMetrics:
         ]
 
         assert core._find_active_vm(enriched) == "vm2"
+
+# =============================================================================
+# 22. TESTS DU COLLECTOR SPOKE (Adaptive Timeout & Reliability EMA)
+# =============================================================================
+
+class TestCollectorSpoke:
+    
+    @pytest.fixture
+    def collector(self):
+        return CollectorSpoke(Config())
+    
+    def test_adaptive_timeout_with_history(self, collector):
+        """Test that adaptive timeout is calculated from RTT history.
+        
+        Given:
+        - Historical RTT window: [40.0, 42.0, 38.0, 41.0, 39.0] ms
+        - Mean RTT: 40ms = 0.040s
+        - Timeout = 0.040 * 3 = 0.120s
+        
+        Expected:
+        - Result clamped to [0.5, 5.0] = 0.5s (minimum)
+        """
+        history_loader = MagicMock()
+        history_loader.load_window.return_value = [40.0, 42.0, 38.0, 41.0, 39.0]
+        
+        timeout = collector._get_adaptive_timeout("vm1", history_loader)
+        
+        # mean = 40.0 ms, factor = 3.0 → 0.120s, clamped to min 0.5
+        assert timeout == 0.5
+    
+    def test_adaptive_timeout_no_history(self, collector):
+        """Test that fallback timeout is used when history_loader is None."""
+        timeout = collector._get_adaptive_timeout("vm1", history_loader=None)
+        
+        assert timeout == 1.5
+    
+    def test_adaptive_timeout_high_rtt(self, collector):
+        """Test adaptive timeout with high RTT values.
+        
+        Given:
+        - Historical RTT window: [500.0, 600.0, 550.0] ms
+        - Mean RTT: 550ms = 0.55s
+        - Timeout = 0.55 * 3 = 1.65s
+        
+        Expected:
+        - Result is 1.65s (within [0.5, 5.0])
+        """
+        history_loader = MagicMock()
+        history_loader.load_window.return_value = [500.0, 600.0, 550.0]
+        
+        timeout = collector._get_adaptive_timeout("vm1", history_loader)
+        
+        assert abs(timeout - 1.65) < 0.0001
+    
+    def test_adaptive_timeout_insufficient_history(self, collector):
+        """Test that fallback is used when history has fewer than 3 points."""
+        history_loader = MagicMock()
+        history_loader.load_window.return_value = [40.0, 42.0]  # Only 2 points
+        
+        timeout = collector._get_adaptive_timeout("vm1", history_loader)
+        
+        assert timeout == 1.5
+    
+    def test_reliability_ema_success(self, collector):
+        """Test EMA update on successful collection.
+        
+        Given:
+        - Current reliability: 0.8
+        - Alpha: 0.1
+        - Success (result = 1.0)
+        
+        Expected:
+        - Updated = (1 - 0.1) * 0.8 + 0.1 * 1.0 = 0.72 + 0.1 = 0.82
+        """
+        collector.reliability_ema["vm1"] = 0.8
+        
+        updated = collector._update_reliability("vm1", success=True)
+        
+        assert abs(updated - 0.82) < 0.0001
+        assert collector.reliability_ema["vm1"] == updated
+    
+    def test_reliability_ema_failure(self, collector):
+        """Test EMA update on failed collection.
+        
+        Given:
+        - Current reliability: 1.0
+        - Alpha: 0.1
+        - Failure (result = 0.0)
+        
+        Expected:
+        - Updated = (1 - 0.1) * 1.0 + 0.1 * 0.0 = 0.9
+        """
+        collector.reliability_ema["vm1"] = 1.0
+        
+        updated = collector._update_reliability("vm1", success=False)
+        
+        assert abs(updated - 0.9) < 0.0001
+        assert collector.reliability_ema["vm1"] == updated
+    
+    def test_reliability_initialized_at_1(self, collector):
+        """Test that unknown VM reliability is initialized at 1.0 before EMA.
+        
+        Given:
+        - VM never seen before (not in reliability_ema dict)
+        - Success (result = 1.0)
+        
+        Expected:
+        - Initial value: 1.0
+        - Updated = (1 - 0.1) * 1.0 + 0.1 * 1.0 = 1.0
+        """
+        updated = collector._update_reliability("vm_new", success=True)
+        
+        assert abs(updated - 1.0) < 0.0001
+        assert "vm_new" in collector.reliability_ema
+    
+    def test_collect_real_data_source(self, collector):
+        """Test that successful collection returns data_source='real' with reliability."""
+        with patch('orchestrator.requests.get') as mock_get:
+            mock_response = MagicMock()
+            mock_response.json.return_value = {
+                "cpu_usage": 45.0,
+                "ram_usage": 60.0,
+                "is_active_service": True
+            }
+            mock_get.return_value = mock_response
+            
+            result = collector.collect_vm_metrics("vm1", history_loader=None)
+            
+            assert result["data_source"] == "real"
+            assert result["vm_id"] == "vm1"
+            assert result["cpu_usage"] == 45.0
+            assert result["ram_usage"] == 60.0
+            assert result["is_active_service"] is True
+            assert "reliability" in result
+            assert result["reliability"] > 0.0
+    
+    def test_collect_simulated_data_source(self, collector):
+        """Test that failed collection returns data_source='simulated' with updated reliability.
+        
+        When:
+        - requests.get raises an exception
+        
+        Then:
+        - data_source should be "simulated"
+        - reliability_ema should decrease (failure)
+        - reliability field should be present
+        """
+        with patch('orchestrator.requests.get') as mock_get:
+            mock_get.side_effect = Exception("Connection timeout")
+            
+            result = collector.collect_vm_metrics("vm1", history_loader=None)
+            
+            assert result["data_source"] == "simulated"
+            assert result["vm_id"] == "vm1"
+            assert "cpu_usage" in result
+            assert "ram_usage" in result
+            assert result["is_active_service"] is False
+            assert "reliability" in result
+            # After first failure, reliability should be ~0.9
+            assert collector.reliability_ema["vm1"] < 1.0
+
+# =============================================================================
+# 13. TESTS DE QUALITÉ DES DONNÉES (Data Quality)
+# =============================================================================
+
+class TestDataQuality:
+    
+    @pytest.fixture
+    def db(self, tmp_path):
+        db_file = tmp_path / "test_quality.db"
+        config = Config(DB_NAME=str(db_file))
+        db = DatabaseSpoke(config)
+        db.init_db()
+        return db
+
+    def test_data_source_stored(self, db):
+        """Vérifie que data_source est bien persisté dans SQLite."""
+        measurement = [{"vm_id": "vm1", "rtt_ms": 20.0, "data_source": "real"}]
+        db.save_metrics(measurement, "autonomous", [])
+        
+        with sqlite3.connect(db.config.DB_NAME) as conn:
+            row = conn.execute("SELECT data_source FROM metrics WHERE id=1").fetchone()
+            assert row[0] == "real"
+
+    def test_data_quality_ratio(self, db):
+        """Vérifie le calcul du ratio real/(real+simulated)."""
+        # 7 mesures réelles
+        for _ in range(7):
+            db.save_metrics([{"vm_id": "vm1", "data_source": "real"}], "auto")
+        # 3 mesures simulées
+        for _ in range(3):
+            db.save_metrics([{"vm_id": "vm1", "data_source": "simulated"}], "auto")
+            
+        ratio = db.get_data_quality_ratio(window_seconds=300)
+        assert ratio == 0.7
+
+    def test_data_quality_empty_db(self, db):
+        """Vérifie que le ratio est de 1.0 si la base est vide."""
+        assert db.get_data_quality_ratio(window_seconds=300) == 1.0
+
+# =============================================================================
+# 14. TESTS DE FIABILITÉ HUB (Reliability Hub)
+# =============================================================================
+
+class TestReliabilityHub:
+    
+    @pytest.fixture
+    def core(self):
+        config = Config()
+        return OrchestratorCore(config)
+
+    def test_get_reliability_scores_empty(self, core):
+        """Vérifie que le hub retourne un dictionnaire vide si le collecteur n'a rien."""
+        core.collector.reliability_ema = {}
+        assert core.get_reliability_scores() == {}
+
+    def test_get_reliability_scores_values(self, core):
+        """Vérifie que le hub retourne les scores du collecteur."""
+        scores = {"vm1": 0.9, "vm2": 0.7}
+        core.collector.reliability_ema = scores
+        assert core.get_reliability_scores() == scores
+
+# =============================================================================
+# 15. TESTS FIABILITÉ TOPSIS (Reliability TOPSIS)
+# =============================================================================
+
+class TestReliabilityTOPSIS:
+    
+    @pytest.fixture
+    def spoke(self):
+        return DecisionIntelligenceSpoke(Config())
+
+    def test_topsis_penalizes_low_reliability(self, spoke):
+        """Vérifie que TOPSIS choisit la VM la plus fiable à prédictions égales."""
+        candidates = [
+            {"vm_id": "vm1", "rtt_ms": 20.0}, # Peu fiable
+            {"vm_id": "vm2", "rtt_ms": 20.0}  # Très fiable
+        ]
+        # Prédictions identiques (25ms pour la latence)
+        preds_map = {
+            "vm1": {"latency": [25.0]*5},
+            "vm2": {"latency": [25.0]*5}
+        }
+        slos = [{"metric": "latency", "threshold": 50.0, "weight": 1.0}]
+        weights = {"latency": 1.0}
+        reliability = {"vm1": 0.3, "vm2": 0.9}
+        
+        best = spoke._topsis_select(
+            candidates, preds_map, slos, weights, 
+            reliability_scores=reliability
+        )
+        assert best["vm_id"] == "vm2"
+
+    def test_topsis_reliability_none_no_crash(self, spoke):
+        """Vérifie que le système ne crashe pas si reliability_scores est None."""
+        candidates = [{"vm_id": "vm1", "rtt_ms": 20.0}]
+        preds_map = {"vm1": {"latency": [25.0]*5}}
+        slos = [{"metric": "latency", "threshold": 50.0, "weight": 1.0}]
+        weights = {"latency": 1.0}
+        
+        # Ne doit pas crash
+        best = spoke._topsis_select(
+            candidates, preds_map, slos, weights, 
+            reliability_scores=None
+        )
+        assert best["vm_id"] == "vm1"
+
+# =============================================================================
+# 16. TESTS MISE À JOUR DÉCISION (Update Decision)
+# =============================================================================
+
+class TestUpdateDecision:
+    
+    @pytest.fixture
+    def viz(self):
+        return ObservabilitySpoke(Config())
+
+    def test_migrate_stores_detail(self, viz):
+        """Vérifie que les détails de migration sont correctement stockés."""
+        dec = {
+            "decision": "migrate",
+            "from_vm": "vm1",
+            "to_vm": "vm3",
+            "reason": "vm1 cpu 85%>SLO 70%",
+            "topsis_score": 0.847,
+            "uncertainty": 0.12
+        }
+        viz.update_decision(dec)
+        
+        detail = viz.last_decision_detail
+        assert detail["topsis_score"] == 0.847
+        assert detail["breach_type"] == "reactive"
+        assert viz.last_decision == dec # Rétrocompatibilité
+
+    def test_proactive_breach_inferred(self, viz):
+        """Vérifie l'inférence du type proactive par le texte."""
+        dec = {"decision": "migrate", "reason": "breach prédit dans 2 steps"}
+        viz.update_decision(dec)
+        assert viz.last_decision_detail["breach_type"] == "proactive"
+
+    def test_empty_dec_no_crash(self, viz):
+        """Vérifie que les dictionnaires vides ne causent pas de crash."""
+        viz.update_decision({})
+        assert viz.last_decision_detail["decision"] == "stay"
+        assert viz.last_decision_detail["topsis_score"] == 0.0
+
+    def test_explicit_breach_type_priority(self, viz):
+        """Vérifie que le type explicite est prioritaire sur l'inférence."""
+        dec = {"breach_type": "proactive", "reason": "vm1 cpu>SLO"}
+        viz.update_decision(dec)
+        # Raison contient '>' (reactive) mais breach_type dit 'proactive'
+        assert viz.last_decision_detail["breach_type"] == "proactive"
+
+# =============================================================================
+# 17. TESTS ÉVOLUTION MI (MI Evolution)
+# =============================================================================
+
+class TestMIEvolution:
+    
+    @pytest.fixture
+    def viz(self):
+        return ObservabilitySpoke(Config())
+
+    def test_update_mi_scores_stores(self, viz):
+        """Vérifie que les scores MI sont correctement stockés dans l'historique."""
+        scores = {"latency": 0.1, "cpu_usage": 0.7, "ram_usage": 0.4}
+        viz.update_mi_scores(scores)
+        assert len(viz.mi_scores_history) == 1
+        assert viz.mi_scores_history[0]["cpu_usage"] == 0.7
+
+    def test_fifo_truncation(self, viz):
+        """Vérifie que l'historique est tronqué à max_mi_points (50)."""
+        for i in range(55):
+            viz.update_mi_scores({"latency": float(i)/100})
+        
+        assert len(viz.mi_scores_history) == 50
+        # Le premier élément doit être le 6ème ajouté (index 5)
+        assert viz.mi_scores_history[0]["latency"] == 0.05
+
+    def test_empty_dict_no_crash(self, viz):
+        """Vérifie que l'envoi d'un dict vide ne provoque pas de crash."""
+        viz.update_mi_scores({})
+        assert len(viz.mi_scores_history) == 0
+
+# =============================================================================
+# 18. TESTS TITRE DASHBOARD (Suptitle Construction)
+# =============================================================================
+
+class TestSuptitle:
+    
+    @pytest.fixture
+    def viz(self):
+        v = ObservabilitySpoke(Config())
+        v.current_slos = [{"metric": "latency", "threshold": 50, "unit": "ms"}]
+        return v
+
+    def test_migrate_title_contains_topsis(self, viz):
+        """Vérifie que le titre contient le score TOPSIS en cas de migration."""
+        viz.last_decision_detail = {
+            "decision": "migrate",
+            "from_vm": "vm1",
+            "to_vm": "vm2",
+            "topsis_score": 0.847,
+            "breach_type": "proactive",
+            "uncertainty": 0.15
+        }
+        title, color = viz._build_suptitle()
+        assert "TOPSIS:0.847" in title
+        assert color == "red"
+
+    def test_stay_title_nominal(self, viz):
+        """Vérifie que le titre commence par STAY et est vert."""
+        viz.last_decision_detail = {
+            "decision": "stay",
+            "reason": "Nominal"
+        }
+        title, color = viz._build_suptitle()
+        assert title.startswith("STAY")
+        assert color == "green"
+
+    def test_mi_line_present(self, viz):
+        """Vérifie l'affichage des scores MI dans le titre."""
+        viz.mi_scores_history = [{
+            "cpu_usage": 0.73,
+            "ram_usage": 0.41,
+            "latency": 0.18
+        }]
+        title, _ = viz._build_suptitle()
+        assert "MI:" in title
+        assert "cpu=0.73" in title
+        assert "ram=0.41" in title
+
+    def test_data_quality_displayed(self, viz):
+        """Vérifie l'affichage du ratio de qualité des données."""
+        viz.data_quality = 0.942
+        title, _ = viz._build_suptitle()
+        assert "94.2%" in title
+
+# =============================================================================
+# 19. TESTS D'INTÉGRATION OBSERVABILITY (Observability Integration)
+# =============================================================================
+
+class TestObservabilitySpokeIntegration:
+    """
+    Stratégie de test : Test d'intégration fonctionnelle sans interface graphique.
+    On valide la chaîne complète de traitement de l'ObservabilitySpoke :
+    1. Réception des métriques brutes (détection locale de violations).
+    2. Réception des décisions du Hub (mise à jour des métadonnées et timeline).
+    3. Réception des scores MI et de la qualité des données.
+    4. Vérification de la cohérence du titre généré (suptitle) qui synthétise tout l'état.
+    L'objectif est de garantir que le composant maintient un état interne cohérent
+    pour l'affichage sans dépendre des autres Spokes ou d'un affichage réel.
+    """
+
+    @pytest.fixture
+    def viz(self):
+        config = Config()
+        viz = ObservabilitySpoke(config)
+        viz.current_slos = [
+            {"metric": "cpu_usage", "threshold": 70, "operator": "<", "weight": 0.5},
+            {"metric": "latency", "threshold": 50, "operator": "<", "weight": 0.5}
+        ]
+        return viz
+
+    def test_full_cycle_migrate(self, viz):
+        """Simule un cycle complet : violation détectée suivie d'une migration."""
+        # 1. Données en violation
+        viz.update_data([{"vm_id": "vm1", "rtt_ms": 65, "cpu_usage": 85, "ram_usage": 50, "is_active_service": True}])
+        
+        # 2. Décision de migration reçue
+        dec = {
+            "decision": "migrate", 
+            "from_vm": "vm1", 
+            "to_vm": "vm3",
+            "reason": "cpu 85>70", 
+            "topsis_score": 0.84,
+            "uncertainty": 0.1
+        }
+        viz.update_decision(dec)
+        
+        # 3. Scores MI reçus
+        viz.update_mi_scores({"cpu_usage": 0.73, "latency": 0.18, "ram_usage": 0.4})
+        
+        # 4. Qualité des données reçue
+        viz.update_quality(0.94)
+
+        # Assertions
+        assert viz.last_decision_detail["topsis_score"] == 0.84
+        assert len(viz.violation_timeline) >= 1
+        # La première doit être une violation de CPU ou Latency
+        assert viz.violation_timeline[0]["metric"] in ["cpu_usage", "latency"]
+        # La dernière doit être la migration
+        assert viz.violation_timeline[-1]["type"] == "migration"
+        assert len(viz.mi_scores_history) == 1
+        assert viz.data_quality == 0.94
+
+    def test_full_cycle_stay(self, viz):
+        """Simule un cycle nominal sans violation ni migration."""
+        # 1. Données saines
+        viz.update_data([{"vm_id": "vm1", "rtt_ms": 30, "cpu_usage": 50, "ram_usage": 40, "is_active_service": True}])
+        
+        # 2. Décision de maintien
+        viz.update_decision({"decision": "stay", "reason": "Nominal"})
+        
+        # Assertions
+        assert viz.last_decision_detail["decision"] == "stay"
+        assert len(viz.violation_timeline) == 0
+        # Aucune migration ne doit être présente
+        assert all(ev["type"] != "migration" for ev in viz.violation_timeline)
+
+    def test_timeline_ordering(self, viz):
+        """Vérifie l'ordre chronologique et le cumul des événements dans la timeline."""
+        # Injecter 3 violations (une par VM par exemple)
+        viz.update_data([
+            {"vm_id": "vm1", "cpu_usage": 90},
+            {"vm_id": "vm2", "cpu_usage": 95},
+            {"vm_id": "vm3", "cpu_usage": 88}
+        ])
+        
+        # Injecter 1 migration
+        viz.update_decision({"decision": "migrate", "from_vm": "vm1", "to_vm": "vm4"})
+        
+        assert len(viz.violation_timeline) == 4
+        assert viz.violation_timeline[0]["type"] == "violation"
+        assert viz.violation_timeline[-1]["type"] == "migration"
+
+    def test_suptitle_coherence(self, viz):
+        """Vérifie que le titre généré reflète fidèlement l'état d'intégration."""
+        # Préparation via le cycle de migration
+        self.test_full_cycle_migrate(viz)
+        
+        title, color = viz._build_suptitle()
+        
+        assert color == "red"
+        assert "vm1" in title
+        assert "vm3" in title
+        assert "94.0%" in title
+
+    def test_resilience_bad_data(self, viz):
+        """Vérifie que le composant est robuste face à des données corrompues ou manquantes."""
+        try:
+            viz.update_data([{}])  # Liste vide ou dict vide
+            viz.update_decision({}) # Décision vide
+            viz.update_mi_scores(None) # None au lieu de dict
+            viz.update_quality(-5.0)   # Valeur hors bornes
+        except Exception as e:
+            pytest.fail(f"ObservabilitySpoke a crashé avec des données invalides : {e}")
+            
+        assert viz.data_quality == 0.0 # Clamp min
+        assert viz.last_decision_detail["decision"] == "stay"
+
+# =============================================================================
+# 20. TESTS HISTORIQUE INTENTIONS (Intent History)
+# =============================================================================
+
+class TestIntentHistory:
+    
+    @pytest.fixture
+    def spoke(self):
+        config = Config()
+        core = MagicMock()
+        return IntentManagerSpoke(config, core, ":memory:", [])
+
+    def test_history_grows_on_success(self, spoke):
+        """Vérifie que l'historique s'incrémente après un tour réussi."""
+        slos = [{"metric": "latency", "threshold": 50, "unit": "ms", "operator": "<", "weight": 1.0}]
+        spoke._record_intent_turn("test rapide", slos)
+        
+        assert len(spoke.intent_history) == 1
+        assert spoke.intent_history[0]["turn"] == 1
+        assert spoke.intent_history[0]["text"] == "test rapide"
+
+    def test_history_fifo_truncation(self, spoke):
+        """Vérifie que l'historique est tronqué à 10 tours (FIFO)."""
+        for i in range(12):
+            spoke._record_intent_turn(f"intent {i}", [])
+            
+        assert len(spoke.intent_history) == 10
+        # Le premier élément doit être l'index 2 (le 3ème ajouté)
+        assert spoke.intent_history[0]["text"] == "intent 2"
+
+    def test_history_turn_increments(self, spoke):
+        """Vérifie que le numéro de tour s'incrémente séquentiellement."""
+        for _ in range(3):
+            spoke._record_intent_turn("dummy", [])
+        assert spoke.intent_history[2]["turn"] == 3
+
+    def test_rag_context_includes_history(self, spoke):
+        """Vérifie que l'historique des intentions est inclus dans le contexte RAG."""
+        # Préparer l'historique
+        spoke.intent_history = [
+            {
+                "turn": 1, "text": "init", 
+                "slos": [{"metric": "latency", "threshold": 100, "unit": "ms"}]
+            },
+            {
+                "turn": 2, "text": "faster", 
+                "slos": [{"metric": "latency", "threshold": 50, "unit": "ms"}]
+            }
+        ]
+        
+        # Mocker le Hub (core) pour retourner des données vides
+        spoke.core.get_recent_context.return_value = []
+        
+        builder = spoke._RAGContextBuilder(
+            spoke.config, spoke.core, 
+            [{"metric": "latency", "threshold": 50, "unit": "ms", "operator": "<"}],
+            history=spoke.intent_history
+        )
+        
+        context = builder.build_context()
+        
+        assert "Historique des intentions" in context
+        assert "Tour 1" in context
+        assert "Tour 2" in context
+        assert "faster" in context
+
+# =============================================================================
+# 21. TESTS RAFFINEMENT INTENTIONS (Intent Refinement)
+# =============================================================================
+
+class TestIntentRefinement:
+    
+    @pytest.fixture
+    def spoke(self):
+        config = Config()
+        core = MagicMock()
+        return IntentManagerSpoke(config, core, ":memory:", [])
+
+    def test_replace_direct_intent(self, spoke):
+        """Intention directe sans mot-clé de raffinement -> REPLACE."""
+        text = "je veux une latence < 20ms"
+        current_slos = [{"metric": "latency", "threshold": 50}]
+        mode = spoke._detect_refinement_mode(text, current_slos, ["latency"])
+        assert mode == "REPLACE"
+
+    def test_additive_keyword(self, spoke):
+        """Présence de 'aussi' -> ADDITIVE."""
+        text = "ajoute aussi cpu < 50%"
+        current_slos = [{"metric": "latency", "threshold": 50}]
+        mode = spoke._detect_refinement_mode(text, current_slos, ["cpu_usage"])
+        assert mode == "ADDITIVE"
+
+    def test_additive_no_overlap(self, spoke):
+        """Métrique différente sans mot-clé -> ADDITIVE."""
+        text = "je veux cpu < 50%"
+        current_slos = [{"metric": "latency", "threshold": 50}]
+        mode = spoke._detect_refinement_mode(text, current_slos, ["cpu_usage"])
+        assert mode == "ADDITIVE"
+
+    def test_replace_overlap(self, spoke):
+        """Même métrique sans mot-clé -> REPLACE."""
+        text = "je veux latence < 10ms"
+        current_slos = [{"metric": "latency", "threshold": 50}, {"metric": "cpu_usage", "threshold": 80}]
+        mode = spoke._detect_refinement_mode(text, current_slos, ["latency"])
+        assert mode == "REPLACE"
+
+    def test_additive_accents(self, spoke):
+        """Vérifie que la normalisation gère les accents pour 'également'."""
+        text = "également ram < 80%"
+        current_slos = [{"metric": "latency", "threshold": 50}]
+        mode = spoke._detect_refinement_mode(text, current_slos, ["ram_usage"])
+        assert mode == "ADDITIVE"
+
+    def test_additive_overlap_with_keyword(self, spoke):
+        """Même métrique MAIS mot-clé 'ajoute' -> ADDITIVE."""
+        text = "ajoute aussi ram < 80%"
+        current_slos = [{"metric": "ram_usage", "threshold": 50}]
+        mode = spoke._detect_refinement_mode(text, current_slos, ["ram_usage"])
+        assert mode == "ADDITIVE"
+
+    def test_replace_empty_slos(self, spoke):
+        """Si aucun SLO existant -> REPLACE."""
+        text = "je veux de la performance"
+        current_slos = []
+        mode = spoke._detect_refinement_mode(text, current_slos, [])
+        assert mode == "REPLACE"
+
+# =============================================================================
+# 22. TESTS FUSION SLO (SLO Merge & Refinement)
+# =============================================================================
+
+class TestSLOMerge:
+    
+    @pytest.fixture
+    def spoke(self):
+        config = Config()
+        core = MagicMock()
+        return IntentManagerSpoke(config, core, ":memory:", [])
+
+    def test_replace_returns_new(self, spoke):
+        """Mode REPLACE doit retourner uniquement les nouveaux SLOs."""
+        existing = [{"metric": "latency", "threshold": 50, "weight": 1.0}]
+        new = [{"metric": "cpu_usage", "threshold": 70, "weight": 1.0}]
+        result = spoke._merge_slos(existing, new, "REPLACE")
+        assert len(result) == 1
+        assert result[0]["metric"] == "cpu_usage"
+
+    def test_additive_union(self, spoke):
+        """Mode ADDITIVE doit faire l'union des SLOs."""
+        existing = [{"metric": "latency", "threshold": 50, "weight": 0.5}]
+        new = [{"metric": "cpu_usage", "threshold": 70, "weight": 0.5}]
+        result = spoke._merge_slos(existing, new, "ADDITIVE")
+        assert len(result) == 2
+        metrics = [s["metric"] for s in result]
+        assert "latency" in metrics
+        assert "cpu_usage" in metrics
+
+    def test_additive_overrides_same_metric(self, spoke):
+        """Mode ADDITIVE doit écraser les SLOs de même métrique."""
+        existing = [{"metric": "latency", "threshold": 50, "weight": 1.0}]
+        new = [{"metric": "latency", "threshold": 20, "weight": 1.0}]
+        result = spoke._merge_slos(existing, new, "ADDITIVE")
+        assert len(result) == 1
+        assert result[0]["threshold"] == 20
+
+    def test_refine_strict_more(self, spoke):
+        """Mode REFINE 'plus strict' doit réduire le threshold (x0.85)."""
+        existing = [{"metric": "latency", "threshold": 50.0, "weight": 1.0}]
+        result = spoke._merge_slos(existing, [], "REFINE", "rends ca plus strict")
+        assert result[0]["threshold"] == 42.5 # 50 * 0.85
+
+    def test_refine_strict_less(self, spoke):
+        """Mode REFINE 'moins strict' doit augmenter le threshold (x1.15)."""
+        existing = [{"metric": "cpu_usage", "threshold": 70.0, "weight": 1.0}]
+        result = spoke._merge_slos(existing, [], "REFINE", "relâche la contrainte")
+        assert result[0]["threshold"] == 80.5 # 70 * 1.15
+
+    def test_refine_ignore_metric(self, spoke):
+        """Mode REFINE 'ignore' doit supprimer la métrique mentionnée."""
+        existing = [
+            {"metric": "cpu_usage", "threshold": 70},
+            {"metric": "ram_usage", "threshold": 80}
+        ]
+        # "oublie" est dans IGNORE_KW, "ram" est dans METRIC_KEYWORDS["ram_usage"]
+        result = spoke._merge_slos(existing, [], "REFINE", "oublie la ram")
+        assert len(result) == 1
+        assert result[0]["metric"] == "cpu_usage"
+
+    def test_normalize_weights_after_merge(self, spoke):
+        """Vérifie que les poids sont redistribués après une fusion additive."""
+        existing = [{"metric": "latency", "threshold": 50, "weight": 1.0}]
+        new = [{"metric": "cpu_usage", "threshold": 70, "weight": 1.0}]
+        result = spoke._merge_slos(existing, new, "ADDITIVE")
+        total_weight = sum(s["weight"] for s in result)
+        assert abs(total_weight - 1.0) < 0.001
+        assert result[0]["weight"] == 0.5
+        assert result[1]["weight"] == 0.5
 
 # =============================================================================
 # MAIN
