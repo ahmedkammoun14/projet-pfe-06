@@ -233,14 +233,13 @@ class TestSpokesData:
 
     @patch('requests.get')
     def test_ml_predictor_api_fallback(self, mock_get):
-        """Vérifie le fallback local si l'API ML est injoignable."""
+        """Vérifie qu'aucune prédiction locale n'est simulée si l'API ML est injoignable."""
         mock_get.side_effect = Exception("Connection Error")
         predictor = MLPredictorSpoke(Config())
         
         preds = predictor.get_prediction(20.0)
         
-        assert len(preds) == 5 # simulation locale génère 5 points
-        assert preds[0] > 20.0 # simulation locale fait croître la valeur
+        assert preds == []
 
     @patch('requests.get')
     def test_collector_api_success(self, mock_get):
@@ -1829,14 +1828,15 @@ class TestCollectorSpoke:
             assert "reliability" in result
             assert result["reliability"] > 0.0
     
-    def test_collect_simulated_data_source(self, collector):
-        """Test that failed collection returns data_source='simulated' with updated reliability.
+    def test_collect_unavailable_data_source(self, collector):
+        """Test that failed collection returns data_source='unavailable' with updated reliability.
         
         When:
         - requests.get raises an exception
         
         Then:
-        - data_source should be "simulated"
+        - data_source should be "unavailable"
+        - no CPU/RAM metrics should be locally simulated
         - reliability_ema should decrease (failure)
         - reliability field should be present
         """
@@ -1845,10 +1845,10 @@ class TestCollectorSpoke:
             
             result = collector.collect_vm_metrics("vm1", history_loader=None)
             
-            assert result["data_source"] == "simulated"
+            assert result["data_source"] == "unavailable"
             assert result["vm_id"] == "vm1"
-            assert "cpu_usage" in result
-            assert "ram_usage" in result
+            assert "cpu_usage" not in result
+            assert "ram_usage" not in result
             assert result["is_active_service"] is False
             assert "reliability" in result
             # After first failure, reliability should be ~0.9
@@ -1878,13 +1878,13 @@ class TestDataQuality:
             assert row[0] == "real"
 
     def test_data_quality_ratio(self, db):
-        """Vérifie le calcul du ratio real/(real+simulated)."""
+        """Vérifie le calcul du ratio real/total."""
         # 7 mesures réelles
         for _ in range(7):
             db.save_metrics([{"vm_id": "vm1", "data_source": "real"}], "auto")
-        # 3 mesures simulées
+        # 3 mesures indisponibles
         for _ in range(3):
-            db.save_metrics([{"vm_id": "vm1", "data_source": "simulated"}], "auto")
+            db.save_metrics([{"vm_id": "vm1", "data_source": "unavailable"}], "auto")
             
         ratio = db.get_data_quality_ratio(window_seconds=300)
         assert ratio == 0.7

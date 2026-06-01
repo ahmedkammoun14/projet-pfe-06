@@ -78,8 +78,6 @@ curl http://localhost:8000/status
 
 ## 📂 Project Structure
 - `orchestrator.py`: The main Hub-and-Spoke implementation (1700+ lines).
-- `intent_engine/`: Logic for LLM communication and RAG (Retrieval Augmented Generation).
-- `models/`: Pydantic schemas for data integrity.
 - `vm_simulator.py`: Simulates 4 VMs with health/metrics REST endpoints.
 - `picar_simulator.py`: Simulates a mobile sensor reporting RTT.
 - `test_orchestrator.py`: Comprehensive test suite (Unit + Integration).

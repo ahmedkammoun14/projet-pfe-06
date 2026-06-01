@@ -4,7 +4,6 @@ import functools
 import json
 import logging
 import math
-import random
 import re
 import socket
 import sqlite3
@@ -152,30 +151,30 @@ class Config:
     DATABASE_PORT: int = 8020
     HISTORY_LOADER_PORT: int = 8021
     METRICS_MANAGER_PORT: int = 8022
-    
+
     # ML & Intent URLs
     INTENT_ENGINE_URL: str = "http://localhost:11434/api/chat"
     ML_RTT_URL: str = "http://localhost:5001/predict"
     ML_CPU_URL: str = "http://localhost:5002/predict"
     ML_RAM_URL: str = "http://localhost:5003/predict"
-    
+
     # VM Settings
     VM_LIST: List[str] = field(default_factory=lambda: ["vm1", "vm2", "vm3", "vm4"])
     VM_PORTS: Dict[str, int] = field(default_factory=lambda: {
         "vm1": 8101, "vm2": 8102, "vm3": 8103, "vm4": 8104
     })
-    
+
     # Default Thresholds
     DEFAULT_LATENCY_THRESHOLD: float = 50.0
     DEFAULT_CPU_THRESHOLD: float = 75.0
     DEFAULT_RAM_THRESHOLD: float = 80.0
-    
+
     # Collector Adaptive Timeout & Reliability
     COLLECTOR_MIN_TIMEOUT: float = 0.5
     COLLECTOR_MAX_TIMEOUT: float = 5.0
     COLLECTOR_TIMEOUT_FACTOR: float = 3.0
     COLLECTOR_RELIABILITY_ALPHA: float = 0.1
-    
+
     # Simulation & Database
     COLLECTION_INTERVAL: int = 5
     HISTORY_WINDOW: int = 10
@@ -188,6 +187,36 @@ class Config:
     COOLDOWN_SECONDS: int = 60
     PROACTIVE_FACTOR: float = 0.85
     HORIZON_ALERT: int = 3
+
+
+@dataclass
+class ValidationResult:
+    """Structure for SLO validation feedback and correction."""
+    is_valid: bool
+    errors: List[str]
+    warnings: List[str]
+    corrected_slos: List[Dict]
+
+
+@dataclass
+class PredictionResult:
+    """Encapsulates ML predictions with confidence intervals."""
+    predictions: List[float]
+    uncertainty: float
+    confidence_low: List[float] = field(default_factory=list)
+    confidence_high: List[float] = field(default_factory=list)
+
+    def __eq__(self, other):
+        if isinstance(other, list):
+            return self.predictions == other
+        if not isinstance(other, PredictionResult):
+            return False
+        return (
+            self.predictions == other.predictions
+            and self.uncertainty == other.uncertainty
+            and self.confidence_low == other.confidence_low
+            and self.confidence_high == other.confidence_high
+        )
 
 # --- SPOKES (SERVICES) ---
 
@@ -225,13 +254,7 @@ class LatencyManagerSpoke:
         ).start()
         logger.info(f"[LatencyManager] API started on port {self.config.LATENCY_PORT}")
 
-@dataclass
-class ValidationResult:
-    """Structure for SLO validation feedback and correction."""
-    is_valid: bool
-    errors: List[str]
-    warnings: List[str]
-    corrected_slos: List[Dict]
+
 
 class IntentManagerSpoke:
     """Interfaces with LLM to extract SLOs from natural language with RAG context and validation."""
@@ -887,10 +910,24 @@ class IntentManagerSpoke:
         except Exception as e:
             logger.error(f"[Intent] Confidence logging error: {e}")
         
-        # Enregistrement de l'historique si succès
-        self._record_intent_turn(text, result.corrected_slos)
-            
-        return result.corrected_slos, True
+        new_slos = result.corrected_slos
+        existing_slos = list(getattr(self.core, 'current_slos', []))
+
+        if existing_slos:
+            detected_metrics = [s["metric"] for s in new_slos]
+            mode = self._detect_refinement_mode(
+                text, existing_slos, detected_metrics)
+            conflicts = self._detect_conflict(existing_slos, new_slos)
+            for c in conflicts:
+                logger.warning(
+                    f"[Intent] Conflit {c['metric']}: {c['reason']}")
+            final_slos = self._merge_slos(
+                existing_slos, new_slos, mode, text)
+        else:
+            final_slos = new_slos
+
+        self._record_intent_turn(text, final_slos)
+        return final_slos, True
 
     def _enrich_slo_schema(self, slo: Dict) -> Dict:
         """Enriches an SLO object with OpenSLO-inspired fields if missing.
@@ -1185,10 +1222,10 @@ class CollectorSpoke:
     ) -> Dict:
         """Fetches CPU/RAM metrics from a VM with adaptive timeout and reliability tracking.
         
-        Attempts to retrieve metrics from the VM's /metrics endpoint with an
-        adaptive timeout. On success, marks data_source as "real" and updates
-        reliability upward. On failure, falls back to simulated data and updates
-        reliability downward.
+        Attempts to retrieve metrics from the VM simulator's /metrics endpoint
+        with an adaptive timeout. On success, marks data_source as "real" and
+        updates reliability upward. On failure, returns no CPU/RAM values and
+        marks data_source as "unavailable"; metrics are never locally simulated.
         
         Args:
             vm_id: Identifier of the VM to collect from.
@@ -1198,10 +1235,10 @@ class CollectorSpoke:
         Returns:
             Dictionary with keys:
                 - vm_id: The VM identifier
-                - cpu_usage: CPU utilization percentage [0, 100]
-                - ram_usage: RAM utilization percentage [0, 100]
+                - cpu_usage: CPU utilization percentage [0, 100], if available
+                - ram_usage: RAM utilization percentage [0, 100], if available
                 - is_active_service: Boolean indicating if VM hosts the service
-                - data_source: "real" if from VM, "simulated" if from fallback
+                - data_source: "real" if from VM, "unavailable" otherwise
                 - reliability: EMA reliability score [0.0, 1.0]
         """
         try:
@@ -1226,37 +1263,17 @@ class CollectorSpoke:
         except Exception as e:
             logger.debug(
                 f"[Collector] {vm_id} unreachable: "
-                f"{type(e).__name__} — fallback simulation"
+                f"{type(e).__name__} — metrics unavailable"
             )
             
             reliability = self._update_reliability(vm_id, False)
             
             return {
                 "vm_id": vm_id,
-                "cpu_usage": random.uniform(20, 95),
-                "ram_usage": random.uniform(30, 90),
                 "is_active_service": False,
-                "data_source": "simulated",
+                "data_source": "unavailable",
                 "reliability": round(reliability, 4)
             }
-
-@dataclass
-class PredictionResult:
-    """Encapsulates ML predictions with confidence intervals."""
-    predictions: List[float]
-    uncertainty: float        # scalar [0.0, 1.0]
-    confidence_low: List[float] = field(default_factory=list)
-    confidence_high: List[float] = field(default_factory=list)
-
-    def __eq__(self, other):
-        if isinstance(other, list):
-            return self.predictions == other
-        if not isinstance(other, PredictionResult):
-            return False
-        return (self.predictions == other.predictions and 
-                self.uncertainty == other.uncertainty and 
-                self.confidence_low == other.confidence_low and 
-                self.confidence_high == other.confidence_high)
 
 class MLPredictorSpoke:
     """Handles communication with specialized Machine Learning prediction APIs."""
@@ -1342,8 +1359,8 @@ class MLPredictorSpoke:
         """Classic mode prediction (Latency only)."""
         pred = self._get_api_prediction(self.config.ML_RTT_URL, current_val)
         if pred: return pred
-        logger.warning("[ML] Latency API unavailable -> Local simulation fallback")
-        return [current_val * (1.05 ** i) for i in range(1, 6)]
+        logger.warning("[ML] Latency API unavailable -> prediction unavailable")
+        return []
 
     def get_enhanced_prediction(
         self,
@@ -1353,10 +1370,10 @@ class MLPredictorSpoke:
         history_loader: Optional[Any] = None
     ) -> PredictionResult:
         """
-        Calcule la prédiction avec une cascade de fallbacks :
+        Calcule la prédiction via les APIs de prédiction disponibles :
         1. Séquence historique (via POST /predict_sequence)
         2. Valeur courante seule (via GET /predict)
-        3. Simulation locale (multiplicateur par défaut)
+        Aucune simulation locale n'est produite si les APIs sont indisponibles.
         """
         # Niveau 1 — Séquence historique
         if history_loader is not None:
@@ -1402,14 +1419,10 @@ class MLPredictorSpoke:
                 confidence_high=[]
             )
         
-        # Niveau 3 — Simulation locale
-        logger.warning(f"[ML] {metric} API unavailable -> Local simulation fallback")
-        factors = {"latency": 1.05, "cpu_usage": 1.03, "ram_usage": 1.02}
-        f = factors.get(metric, 1.01)
-        local_preds = [current_val * (f ** i) for i in range(1, 6)]
+        logger.warning(f"[ML] {metric} API unavailable -> prediction unavailable")
         return PredictionResult(
-            predictions=local_preds,
-            uncertainty=0.5, # Incertitude moyenne par défaut pour simulation
+            predictions=[],
+            uncertainty=1.0,
             confidence_low=[],
             confidence_high=[]
         )
@@ -1866,7 +1879,7 @@ class DatabaseSpoke:
 
     @safe_call(1.0, "DatabaseSpoke.get_data_quality_ratio")
     def get_data_quality_ratio(self, window_seconds: int = 300) -> float:
-        """Ratio real/(real+simulated) sur la fenêtre. Retourne 1.0 si vide."""
+        """Ratio real/total sur la fenêtre. Retourne 1.0 si vide."""
         cutoff = (datetime.now(timezone.utc) - timedelta(seconds=window_seconds)).isoformat()
         with sqlite3.connect(self.config.DB_NAME) as conn:
             total = conn.execute("SELECT COUNT(*) FROM metrics WHERE timestamp > ?", (cutoff,)).fetchone()[0]
@@ -2437,6 +2450,7 @@ class OrchestratorCore:
                 
         with self._lock:
             self.current_slos = slos
+            self.intent_mgr.slos_ref = self.current_slos
             self.viz.current_slos = slos
             self.mode = "enhanced"
         
@@ -2584,17 +2598,20 @@ class OrchestratorCore:
         
         # 5. ML Prediction
         log_step("4. ML PREDICTION", "Core -> MLPredictor", active)
-        preds_map = {
-            e["vm_id"]: {
-                m: self.ml.get_enhanced_prediction(
-                    m, 
-                    e.get("rtt_ms" if m == "latency" else m, 0),
-                    vm_id=e["vm_id"],
+        preds_map = {}
+        for e in enriched:
+            vm_id = e["vm_id"]
+            preds_map[vm_id] = {}
+            for m in active:
+                current_val = e.get("rtt_ms" if m == "latency" else m)
+                if current_val is None or current_val == 0:
+                    continue
+                preds_map[vm_id][m] = self.ml.get_enhanced_prediction(
+                    m,
+                    current_val,
+                    vm_id=vm_id,
                     history_loader=self.history
-                ) 
-                for m in active
-            } for e in enriched
-        }
+                )
         
         # extraction .predictions avant passage au viz
         viz_map = {
@@ -2663,17 +2680,20 @@ class OrchestratorCore:
         # 4-6. ML Workflow
         log_step("4. LOAD HISTORY", "Core -> HistoryLoader", active)
         log_step("5. ML PREDICTION REQUEST", "Core -> MLPredictor", active)
-        preds_map = {
-            e["vm_id"]: {
-                m: self.ml.get_enhanced_prediction(
-                    m, 
-                    e.get("rtt_ms" if m == "latency" else m, 0),
-                    vm_id=e["vm_id"],
+        preds_map = {}
+        for e in enriched:
+            vm_id = e["vm_id"]
+            preds_map[vm_id] = {}
+            for m in active:
+                current_val = e.get("rtt_ms" if m == "latency" else m)
+                if current_val is None or current_val == 0:
+                    continue
+                preds_map[vm_id][m] = self.ml.get_enhanced_prediction(
+                    m,
+                    current_val,
+                    vm_id=vm_id,
                     history_loader=self.history
-                ) 
-                for m in active
-            } for e in enriched
-        }
+                )
         
         # extraction .predictions avant passage au viz
         viz_map = {
@@ -2830,7 +2850,7 @@ class OrchestratorCore:
                 requests.get(f"http://localhost:{port}", timeout=2)
                 results.append(f"{Fore.GREEN}✅ ML API {port} OK")
             except Exception:
-                results.append(f"{Fore.YELLOW}⚠️ ML API {port} non détectée (simulation activée)")
+                results.append(f"{Fore.YELLOW}⚠️ ML API {port} non détectée (prédictions indisponibles)")
                 logger.warning(f"ML API sur le port {port} injoignable.")
 
         print("\n".join(results))

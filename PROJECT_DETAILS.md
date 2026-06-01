@@ -76,8 +76,6 @@ Le système ne se contente pas de réagir à un dépassement de seuil. Il utilis
 ## 📂 5. Structure du Code
 
 *   `orchestrator.py` : Code monolithique organisé par classes (Spokes) et une classe maîtresse (`OrchestratorCore`).
-*   `intent_engine/engine.py` : Module dédié à la communication avec Ollama.
-*   `models/schemas.py` : Définition des structures de données via Pydantic (immutabilité garantie).
 *   `test_orchestrator.py` : Tests unitaires et d'intégration validant la logique de normalisation et de décision.
 
 ---
