@@ -877,6 +877,16 @@ class IntentManagerSpoke:
             logger.critical("[Intent] SLOs invalides — aucun SLO valide extrait")
             return [], False
         
+        # Warning pour faible confiance
+        try:
+            for slo in result.corrected_slos:
+                if slo.get("confidence", 1.0) < 0.5:
+                    logger.warning(
+                        f"[Intent] SLO {slo.get('metric')} faible confiance : {slo.get('confidence')}"
+                    )
+        except Exception as e:
+            logger.error(f"[Intent] Confidence logging error: {e}")
+        
         # Enregistrement de l'historique si succès
         self._record_intent_turn(text, result.corrected_slos)
             
@@ -895,12 +905,38 @@ class IntentManagerSpoke:
             "target": 0.99,
             "window": "5m",
             "budget_remaining": 100.0,
-            "violations": 0
+            "violations": 0,
+            "confidence": 1.0
         }
         for key, val in defaults.items():
             if key not in slo:
                 slo[key] = val
         return slo
+
+    def _estimate_confidence(self, slo: Dict) -> float:
+        """Estime la confiance d'un SLO extrait.
+
+        Critères :
+          - threshold explicitement numérique → +0.4
+          - operator valide (<,<=,>,>=)        → +0.3
+          - unit cohérente avec metric         → +0.3
+        Retourne float entre 0.0 et 1.0.
+        """
+        score = 0.0
+        try:
+            if isinstance(slo.get("threshold"), (int, float)):
+                score += 0.4
+            if slo.get("operator") in ["<", "<=", ">", ">="]:
+                score += 0.3
+            unit = slo.get("unit", "")
+            metric = slo.get("metric", "")
+            if (metric == "latency" and unit == "ms") or (
+                metric in ["cpu_usage", "ram_usage"] and unit == "%"
+            ):
+                score += 0.3
+        except Exception:
+            return 0.5
+        return round(min(max(score, 0.0), 1.0), 2)
 
     def _parse_slos_from_text(self, text: str) -> tuple[List[Dict], bool]:
         """Parses JSON or uses regex fallback to extract SLO objects."""
@@ -910,6 +946,10 @@ class IntentManagerSpoke:
             if start != -1 and end != -1:
                 slos = json.loads(text[start:end+1])
                 if isinstance(slos, list) and slos:
+                    # Estimer confidence si manquante
+                    for s in slos:
+                        if "confidence" not in s:
+                            s["confidence"] = self._estimate_confidence(s)
                     return [self._enrich_slo_schema(s) for s in slos], True
         except (ValueError, json.JSONDecodeError):
             pass
@@ -929,7 +969,10 @@ class IntentManagerSpoke:
         # Distribute weights for fallback
         if slos:
             w = round(1.0 / len(slos), 2)
-            for s in slos: s["weight"] = w
+            for s in slos:
+                s["weight"] = w
+                if "confidence" not in s:
+                    s["confidence"] = self._estimate_confidence(s)
             slos[-1]["weight"] = round(1.0 - sum(s["weight"] for s in slos[:-1]), 2)
             return [self._enrich_slo_schema(s) for s in slos], True
 
@@ -939,6 +982,7 @@ class IntentManagerSpoke:
             {"metric": "cpu_usage", "operator": "<", "threshold": 75, "unit": "%", "weight": 0.33},
             {"metric": "ram_usage", "operator": "<", "threshold": 80, "unit": "%", "weight": 0.33}
         ]
+        # enrich will add default confidence
         return [self._enrich_slo_schema(s) for s in raw_fallback], False
 
 class MetricsManagerSpoke:
