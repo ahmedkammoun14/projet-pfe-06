@@ -546,6 +546,63 @@ class IntentManagerSpoke:
             except Exception:
                 return []
 
+    def _detect_conflict(self, existing: List[Dict], new_slos: List[Dict]) -> List[Dict]:
+        """Détecte les conflits entre SLOs existants et nouveaux.
+
+        Returns:
+            List de conflits détectés, chaque conflit = {
+                "metric": str,
+                "reason": str,     ("operator"|"threshold")
+                "existing": Dict,
+                "incoming": Dict
+            }
+        Retourne [] si aucun conflit. Ne crashe jamais.
+        """
+        OPPOSITE_OPS = {
+            "<":  [">", ">="],
+            "<=": [">", ">="],
+            ">":  ["<", "<="],
+            ">=": ["<", "<="]
+        }
+        conflicts: List[Dict] = []
+        try:
+            existing_map = {s.get("metric"): s for s in existing}
+            for new_s in new_slos:
+                metric = new_s.get("metric")
+                if not metric or metric not in existing_map:
+                    continue
+                old_s = existing_map[metric]
+                # Condition A — opérateurs contradictoires
+                old_op = old_s.get("operator", "<")
+                new_op = new_s.get("operator", "<")
+                if new_op in OPPOSITE_OPS.get(old_op, []):
+                    conflicts.append({
+                        "metric": metric,
+                        "reason": "operator",
+                        "existing": old_s,
+                        "incoming": new_s
+                    })
+                    continue
+                # Condition B — écart de threshold > 50%
+                try:
+                    old_t = float(old_s.get("threshold", 0))
+                    new_t = float(new_s.get("threshold", 0))
+                except Exception:
+                    continue
+                if old_t > 0:
+                    ecart = abs(new_t - old_t) / old_t
+                    if ecart > 0.5:
+                        conflicts.append({
+                            "metric": metric,
+                            "reason": "threshold",
+                            "existing": old_s,
+                            "incoming": new_s
+                        })
+        except Exception as e:
+            logger.error(f"[Intent] Conflict detection error: {e}")
+            return []
+        return conflicts
+
     def _record_intent_turn(self, text: str, slos: List[Dict]) -> None:
         """Enregistre un tour réussi dans l'historique FIFO."""
         turn_number = len(self.intent_history) + 1
@@ -774,6 +831,18 @@ class IntentManagerSpoke:
             llm_text = resp.json().get("message", {}).get("content", "").lower()
             
             raw_slos, success = self._parse_slos_from_text(llm_text)
+            # Détection et log des conflits entre SLOs existants et ceux extraits
+            try:
+                existing_slos = getattr(self, 'current_slos', None) or getattr(self, 'slos_ref', None) or getattr(self.core, 'current_slos', None)
+                if existing_slos and raw_slos:
+                    conflicts = self._detect_conflict(existing_slos, raw_slos)
+                    for c in conflicts:
+                        logger.warning(
+                            f"[Intent] Conflit détecté sur {c['metric']} : {c['reason']} "
+                            f"(existant={c['existing'].get('threshold')} -> nouveau={c['incoming'].get('threshold')})"
+                        )
+            except Exception as e:
+                logger.error(f"[Intent] Conflict logging error: {e}")
         except Exception as e:
             logger.warning(f"[Intent] LLM Error: {e}. Falling back to smart matching.")
             success = False
