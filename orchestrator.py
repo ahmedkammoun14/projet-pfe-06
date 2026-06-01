@@ -113,10 +113,14 @@ def safe_call(default_val: Any, context_name: str):
     return decorator
 
 class LatencyHandler(Protocol):
-    """Interface exposée au LatencyManagerSpoke."""
+    """Interface exposée au LatencyManagerSpoke.
+    
+    Deux modes opérationnels :
+    - autonomous : mode par défaut au démarrage (RTT + CPU + RAM + MI selection).
+    - enhanced   : activé après intention utilisateur (RTT + dynamiques SLOs via LLM).
+    """
     @property
     def mode(self) -> str: ...
-    def run_classic_flow(self, measurements: List[Dict]) -> Dict: ...
     def run_autonomous_flow(self, measurements: List[Dict]) -> Dict: ...
     def run_enhanced_flow(self, measurements: List[Dict]) -> Dict: ...
     def set_last_real_data_ts(self, ts: float) -> None: ...
@@ -165,6 +169,12 @@ class Config:
     DEFAULT_LATENCY_THRESHOLD: float = 50.0
     DEFAULT_CPU_THRESHOLD: float = 75.0
     DEFAULT_RAM_THRESHOLD: float = 80.0
+    
+    # Collector Adaptive Timeout & Reliability
+    COLLECTOR_MIN_TIMEOUT: float = 0.5
+    COLLECTOR_MAX_TIMEOUT: float = 5.0
+    COLLECTOR_TIMEOUT_FACTOR: float = 3.0
+    COLLECTOR_RELIABILITY_ALPHA: float = 0.1
     
     # Simulation & Database
     COLLECTION_INTERVAL: int = 5
@@ -225,8 +235,46 @@ class ValidationResult:
 
 class IntentManagerSpoke:
     """Interfaces with LLM to extract SLOs from natural language with RAG context and validation."""
-    
+
+    REFINE_KEYWORDS = ["aussi", "egalement", "plus", "ainsi que", "en plus", "et", "ajoute"]
+    METRIC_KEYWORDS = {
+        "latency": ["latence", "rapide", "reactif", "delai", "ping"],
+        "cpu_usage": ["cpu", "processeur", "charge"],
+        "ram_usage": ["ram", "memoire"]
+    }
+
+    def _normalize(self, text: str) -> str:
+        """Lowercases and removes accents from text."""
+        text = text.lower()
+        return "".join(
+            c for c in unicodedata.normalize('NFD', text)
+            if unicodedata.category(c) != 'Mn'
+        )
+
+    def _detect_refinement_mode(self, text: str, current_slos: List[Dict], detected_metrics: List[str]) -> str:
+        """Détecte si la nouvelle intention doit REMPLACER ou S'AJOUTER aux SLOs actuels."""
+        if not current_slos:
+            return "REPLACE"
+
+        normalized = self._normalize(text)
+
+        # Priorité 1 : Mots-clés de raffinement explicites
+        if any(kw in normalized for kw in self.REFINE_KEYWORDS):
+            return "ADDITIVE"
+
+        # Priorité 2 : Complémentarité sémantique
+        current_metrics = set(s["metric"] for s in current_slos)
+        new_metrics = set(detected_metrics)
+
+        # Si aucune métrique détectée ne chevauche l'existant -> ADDITIVE
+        if not (current_metrics & new_metrics):
+            return "ADDITIVE"
+
+        # Chevauchement trouvé -> REPLACE (on remplace l'existant)
+        return "REPLACE"
+
     class _SLOCoherenceValidator:
+
         """Internal helper to validate physical realism and weight balance of SLOs."""
         PHYSICAL_BOUNDS = {
             "latency":   {"min": 5.0,  "max": 2000.0, "unit": "ms"},
@@ -299,10 +347,11 @@ class IntentManagerSpoke:
 
     class _RAGContextBuilder:
         """Internal helper to build context for LLM by querying recent performance and SLOs through the Hub."""
-        def __init__(self, config: Config, hub: IntentHandler, current_slos: List[Dict]):
+        def __init__(self, config: Config, hub: IntentHandler, current_slos: List[Dict], history: List[Dict] = None):
             self.config = config
             self.hub = hub
             self.current_slos = current_slos
+            self.history = history
 
         def build_context(self) -> str:
             """Aggregates historical and current data into a textual context block."""
@@ -317,10 +366,27 @@ class IntentManagerSpoke:
                 ]
                 slo_ctx = "Derniers SLOs actifs :\n" + "\n".join(slo_lines)
 
+                # 1b. Intent History
+                history_ctx = ""
+                if self.history:
+                    history_lines = []
+                    for turn in self.history[-3:]:  # 3 derniers tours max
+                        slo_summary = ", ".join([
+                            f"{s['metric']}<{s['threshold']}{s['unit']}"
+                            for s in turn["slos"]
+                        ])
+                        history_lines.append(
+                            f"  Tour {turn['turn']} : \"{turn['text']}\""
+                            f" → {slo_summary}"
+                        )
+                    history_ctx = ("Historique des intentions :\n" + "\n".join(history_lines))
+
                 # Fetch data from Hub instead of DatabaseSpoke directly
                 recent_data = self.hub.get_recent_context(300)  # 5 minutes
                 if not recent_data:
-                    return f"{slo_ctx}\n\nAucune donnée de performance récente disponible dans SQLite."
+                    final_ctx = slo_ctx
+                    if history_ctx: final_ctx += f"\n\n{history_ctx}"
+                    return f"{final_ctx}\n\nAucune donnée de performance récente disponible dans SQLite."
 
                 # 2. Performance actuelle (latest point per VM)
                 latest_points: Dict[str, Dict] = {}
@@ -369,11 +435,15 @@ class IntentManagerSpoke:
                     else:
                         percentile_lines.append(f"- {metric:10}: N/A (données insuffisantes)")
 
+                # Assemblage
+                ctx_blocks = [slo_ctx]
+                if history_ctx: ctx_blocks.append(history_ctx)
+                ctx_blocks.extend([perf_ctx, viol_ctx])
                 if any_valid:
-                    hist_ctx = "Seuils historiquement bons (sur 1h) :\n" + "\n".join(percentile_lines)
-                    return f"{slo_ctx}\n\n{perf_ctx}\n\n{viol_ctx}\n\n{hist_ctx}"
+                    ctx_blocks.append("Seuils historiquement bons (sur 1h) :\n" + "\n".join(percentile_lines))
+                
+                return "\n\n".join(ctx_blocks)
 
-                return f"{slo_ctx}\n\n{perf_ctx}\n\n{viol_ctx}"
             except Exception as e:
                 logger.error(f"[RAG] Error building context: {e}")
                 return ""
@@ -385,6 +455,109 @@ class IntentManagerSpoke:
         self.slos_ref = current_slos
         self.app = Flask(f"{__name__}_intent")
         self._setup_routes()
+        self.intent_history: List[Dict] = []
+        self.max_history_turns: int = 10
+
+    STRICT_MORE = ["plus strict", "encore plus", "réduire", "diminue", "baisser", "réduis", "beaucoup plus strict"]
+    STRICT_LESS = ["moins strict", "relâche", "augmente", "monte", "hausse", "assouplis"]
+    IGNORE_KW   = ["ne te préoccupe pas", "ignore", "oublie", "supprime"]
+
+    def _normalize_weights(self, slos: List[Dict]) -> List[Dict]:
+        """Normalise les poids pour que leur somme soit égale à 1.0.
+
+        Implémente la logique demandée par les tests : si la somme des poids
+        existe et dévie de 1.0 de plus de 0.01 on normalise, sinon on renvoie
+        les slos tels quels. Ne provoque jamais d'exception.
+        """
+        try:
+            total = sum(s.get("weight", 0) for s in slos)
+            if total > 0 and abs(total - 1.0) > 0.01:
+                for s in slos:
+                    s["weight"] = round(s.get("weight", 0) / total, 3)
+            return slos
+        except Exception:
+            # En cas d'erreur, retourner les slos d'origine pour éviter crash
+            return slos
+
+    def _merge_slos(self, existing: List[Dict], new_slos: List[Dict], mode: str, original_text: str = "") -> List[Dict]:
+        """Fusionne les SLOs selon le mode.
+
+        REPLACE  -> retourne new_slos
+        ADDITIVE -> union : new_slos + existing sans doublon (new écrase existing)
+        REFINE   -> applique delta sur existing selon original_text ; new_slos ignorés
+        Normalise les poids après merge (somme = 1.0). Ne crashe jamais.
+        """
+        try:
+            if mode == "REPLACE":
+                return self._normalize_weights([dict(s) for s in new_slos])
+
+            if mode == "ADDITIVE":
+                merged: Dict[str, Dict] = {s["metric"]: dict(s) for s in existing}
+                for ns in new_slos:
+                    merged[ns["metric"]] = dict(ns)
+                return self._normalize_weights(list(merged.values()))
+
+            if mode == "REFINE":
+                normalized = self._normalize(original_text or "")
+                # Pré-normaliser les mots-clés pour gérer les accents
+                strict_more_norm = [self._normalize(k) for k in self.STRICT_MORE]
+                strict_less_norm = [self._normalize(k) for k in self.STRICT_LESS]
+                ignore_norm = [self._normalize(k) for k in self.IGNORE_KW]
+
+                result: List[Dict] = []
+                for slo in existing:
+                    try:
+                        # Détecter IGNORE pour la métrique (mot-clé + mention de métrique)
+                        ignored = False
+                        for kw in ignore_norm:
+                            if kw in normalized:
+                                metric_mentioned = any(
+                                    self._normalize(mk) in normalized
+                                    for mk in self.METRIC_KEYWORDS.get(slo.get("metric", ""), [])
+                                )
+                                if metric_mentioned:
+                                    ignored = True
+                                    break
+                        if ignored:
+                            continue
+
+                        # Appliquer facteur de modification
+                        slo_copy = dict(slo)
+                        if any(kw in normalized for kw in strict_more_norm):
+                            slo_copy["threshold"] = round(slo.get("threshold", 0) * 0.85, 2)
+                        elif any(kw in normalized for kw in strict_less_norm):
+                            slo_copy["threshold"] = round(slo.get("threshold", 0) * 1.15, 2)
+                        else:
+                            # Défaut REFINE
+                            slo_copy["threshold"] = round(slo.get("threshold", 0) * 0.90, 2)
+
+                        result.append(slo_copy)
+                    except Exception:
+                        # Ignore problematic SLO and continue
+                        continue
+                return self._normalize_weights(result)
+
+            # Mode inconnu -> safe fallback
+            return self._normalize_weights([dict(s) for s in new_slos])
+        except Exception as e:
+            logger.error(f"[IntentManager] Erreur merge_slos: {e}")
+            try:
+                return existing if existing else new_slos
+            except Exception:
+                return []
+
+    def _record_intent_turn(self, text: str, slos: List[Dict]) -> None:
+        """Enregistre un tour réussi dans l'historique FIFO."""
+        turn_number = len(self.intent_history) + 1
+        entry = {
+            "turn": turn_number,
+            "text": text,
+            "slos": slos,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        self.intent_history.append(entry)
+        if len(self.intent_history) > self.max_history_turns:
+            self.intent_history.pop(0)
 
     def _setup_routes(self):
         @self.app.route('/intent', methods=['POST'])
@@ -583,7 +756,7 @@ class IntentManagerSpoke:
 
         try:
             # Build RAG Context through the Hub
-            builder = self._RAGContextBuilder(self.config, self.core, self.slos_ref)
+            builder = self._RAGContextBuilder(self.config, self.core, self.slos_ref, history=self.intent_history)
             context = builder.build_context()
 
             payload = {
@@ -634,6 +807,9 @@ class IntentManagerSpoke:
         if not result.is_valid:
             logger.critical("[Intent] SLOs invalides — aucun SLO valide extrait")
             return [], False
+        
+        # Enregistrement de l'historique si succès
+        self._record_intent_turn(text, result.corrected_slos)
             
         return result.corrected_slos, True
 
@@ -815,30 +991,142 @@ class MetricsManagerSpoke:
         return -sum(p * math.log2(p) for p in probs if p > 0)
 
 class CollectorSpoke:
-    """Fetches real-time physical metrics (CPU/RAM) from VM simulators."""
+    """Fetches real-time physical metrics (CPU/RAM) from VM simulators with adaptive timeout and reliability tracking."""
+    
     def __init__(self, config: Config):
         self.config = config
-
-    @safe_call({}, "CollectorSpoke.collect_vm_metrics")
-    def collect_vm_metrics(self, vm_id: str) -> Dict:
+        self.reliability_ema: Dict[str, float] = {}
+    
+    def _get_adaptive_timeout(
+        self,
+        vm_id: str,
+        history_loader: Optional[Any] = None
+    ) -> float:
+        """Calculates adaptive timeout based on historical RTT measurements.
+        
+        Dynamically adjusts the timeout value by:
+        1. Loading recent RTT history for the VM (last 5 measurements)
+        2. Computing mean RTT and applying TIMEOUT_FACTOR
+        3. Clamping the result to [MIN_TIMEOUT, MAX_TIMEOUT]
+        
+        If no history is available or history_loader is None, falls back to
+        the original 1.5s timeout for backward compatibility.
+        
+        Args:
+            vm_id: Identifier of the VM to collect from.
+            history_loader: HistoryLoaderSpoke instance for querying RTT history.
+                          If None, uses fallback timeout.
+        
+        Returns:
+            Timeout in seconds, clamped to [COLLECTOR_MIN_TIMEOUT, COLLECTOR_MAX_TIMEOUT].
+        """
+        if history_loader is not None:
+            try:
+                window = history_loader.load_window(vm_id, "latency", 5)
+                if len(window) >= 3:
+                    mean_rtt_ms = sum(window) / len(window)
+                    mean_rtt_s = mean_rtt_ms / 1000.0
+                    timeout = mean_rtt_s * self.config.COLLECTOR_TIMEOUT_FACTOR
+                    return max(
+                        self.config.COLLECTOR_MIN_TIMEOUT,
+                        min(self.config.COLLECTOR_MAX_TIMEOUT, timeout)
+                    )
+            except Exception:
+                pass
+        return 1.5  # fallback timeout
+    
+    def _update_reliability(
+        self,
+        vm_id: str,
+        success: bool
+    ) -> float:
+        """Updates the exponential moving average (EMA) reliability score for a VM.
+        
+        Maintains per-VM reliability tracking using EMA with configurable alpha.
+        - New VMs are initialized at 1.0 (full confidence)
+        - Success increments reliability toward 1.0
+        - Failure decrements reliability toward 0.0
+        - Score is clamped to [0.0, 1.0]
+        
+        Formula: updated = (1 - alpha) * current + alpha * result
+        where result = 1.0 on success, 0.0 on failure
+        
+        Args:
+            vm_id: Identifier of the VM.
+            success: True if the metric collection succeeded, False otherwise.
+        
+        Returns:
+            Updated reliability score, rounded to 4 decimal places.
+        """
+        current = self.reliability_ema.get(vm_id, 1.0)
+        alpha = self.config.COLLECTOR_RELIABILITY_ALPHA
+        result = 1.0 if success else 0.0
+        updated = (1 - alpha) * current + alpha * result
+        self.reliability_ema[vm_id] = updated
+        return updated
+    
+    def collect_vm_metrics(
+        self,
+        vm_id: str,
+        history_loader: Optional[Any] = None
+    ) -> Dict:
+        """Fetches CPU/RAM metrics from a VM with adaptive timeout and reliability tracking.
+        
+        Attempts to retrieve metrics from the VM's /metrics endpoint with an
+        adaptive timeout. On success, marks data_source as "real" and updates
+        reliability upward. On failure, falls back to simulated data and updates
+        reliability downward.
+        
+        Args:
+            vm_id: Identifier of the VM to collect from.
+            history_loader: HistoryLoaderSpoke for computing adaptive timeout.
+                          Optional; uses fallback timeout if None.
+        
+        Returns:
+            Dictionary with keys:
+                - vm_id: The VM identifier
+                - cpu_usage: CPU utilization percentage [0, 100]
+                - ram_usage: RAM utilization percentage [0, 100]
+                - is_active_service: Boolean indicating if VM hosts the service
+                - data_source: "real" if from VM, "simulated" if from fallback
+                - reliability: EMA reliability score [0.0, 1.0]
+        """
         try:
+            timeout = self._get_adaptive_timeout(vm_id, history_loader)
             port = self.config.VM_PORTS.get(vm_id)
-            resp = requests.get(f"http://localhost:{port}/metrics", timeout=1.5)
+            resp = requests.get(
+                f"http://localhost:{port}/metrics",
+                timeout=timeout
+            )
             data = resp.json()
+            
+            reliability = self._update_reliability(vm_id, True)
+            
             return {
-                "vm_id": vm_id, 
-                "cpu_usage": data["cpu_usage"], 
+                "vm_id": vm_id,
+                "cpu_usage": data["cpu_usage"],
                 "ram_usage": data["ram_usage"],
-                "is_active_service": data.get("is_active_service", False)
+                "is_active_service": data.get("is_active_service", False),
+                "data_source": "real",
+                "reliability": round(reliability, 4)
             }
-        except Exception:
-            # Fallback to simulation if VM is unreachable
+        except Exception as e:
+            logger.debug(
+                f"[Collector] {vm_id} unreachable: "
+                f"{type(e).__name__} — fallback simulation"
+            )
+            
+            reliability = self._update_reliability(vm_id, False)
+            
             return {
                 "vm_id": vm_id,
                 "cpu_usage": random.uniform(20, 95),
                 "ram_usage": random.uniform(30, 90),
-                "is_active_service": False
+                "is_active_service": False,
+                "data_source": "simulated",
+                "reliability": round(reliability, 4)
             }
+
 @dataclass
 class PredictionResult:
     """Encapsulates ML predictions with confidence intervals."""
@@ -1094,12 +1382,13 @@ class DecisionIntelligenceSpoke:
         predictions_map: Dict,
         slos: List[Dict],
         weights: Dict[str, float],
-        migration_costs: Optional[Dict[str, int]] = None
+        migration_costs: Optional[Dict[str, int]] = None,
+        reliability_scores: Optional[Dict[str, float]] = None
     ) -> Dict:
         """
         Technique for Order of Preference by Similarity to Ideal Solution (TOPSIS).
         Selects the best VM candidate by minimizing distance to ideal and maximizing distance to anti-ideal.
-        Includes migration_cost as a 6th criterion to penalize frequently moved VMs.
+        Includes migration_cost and reliability as criteria.
         
         Args:
             candidates: List of candidate VM dictionaries.
@@ -1107,6 +1396,7 @@ class DecisionIntelligenceSpoke:
             slos: List of active SLO objects.
             weights: Weight mapping for metrics.
             migration_costs: Map of recent migration counts per VM.
+            reliability_scores: EMA reliability scores per VM.
             
         Returns:
             The best candidate VM dictionary.
@@ -1117,12 +1407,10 @@ class DecisionIntelligenceSpoke:
             return candidates[0]
 
         # 1. ÉTAPE 1 — Construire la matrice de décision
-        # Critères : moyennes prédites pour chaque métrique des SLOs + budget_score global + migration_cost
         metric_names = list(set(s["metric"] for s in slos))
         num_candidates = len(candidates)
         num_metrics = len(metric_names)
         
-        # On a num_metrics critères + 1 budget_score + 1 migration_cost
         matrix = []
         for i, cand in enumerate(candidates):
             row = []
@@ -1151,10 +1439,14 @@ class DecisionIntelligenceSpoke:
             # Critère migration_cost_score
             vm_migration_count = migration_costs.get(vm_id, 0) if migration_costs else 0
             row.append(float(vm_migration_count))
+
+            # Critère reliability_score (1.0 - reliability car TOPSIS minimise)
+            vm_reliability = reliability_scores.get(vm_id, 1.0) if reliability_scores else 1.0
+            row.append(1.0 - vm_reliability)
             
             matrix.append(row)
 
-        num_criteria = num_metrics + 2
+        num_criteria = num_metrics + 3
         
         # 2. ÉTAPE 2 — Normalisation min-max par colonne
         normalized = [[0.0] * num_criteria for _ in range(num_candidates)]
@@ -1174,6 +1466,7 @@ class DecisionIntelligenceSpoke:
             criterion_weights.append(weights.get(m, 0.0))
         criterion_weights.append(1.0) # budget_score
         criterion_weights.append(0.5) # migration_cost_score
+        criterion_weights.append(0.3) # reliability_score
         
         weighted = [[0.0] * num_criteria for _ in range(num_candidates)]
         for i in range(num_candidates):
@@ -1181,7 +1474,6 @@ class DecisionIntelligenceSpoke:
                 weighted[i][k] = normalized[i][k] * criterion_weights[k]
 
         # 4. ÉTAPE 4 — Solution idéale A+ et anti-idéale A-
-        # Tous les critères sont à MINIMISER
         A_plus = [min(weighted[i][k] for i in range(num_candidates)) for k in range(num_criteria)]
         A_minus = [max(weighted[i][k] for i in range(num_candidates)) for k in range(num_criteria)]
 
@@ -1279,7 +1571,7 @@ class DecisionIntelligenceSpoke:
             "breach_type": breach_type
         }
 
-    def evaluate_enhanced_decision(self, current_data: List[Dict], predictions_map: Dict[str, Dict[str, Any]], slos: List[Dict], service_vm=None, migration_costs: Optional[Dict[str, int]] = None) -> Dict:
+    def evaluate_enhanced_decision(self, current_data: List[Dict], predictions_map: Dict[str, Dict[str, Any]], slos: List[Dict], service_vm=None, migration_costs: Optional[Dict[str, int]] = None, reliability_scores: Optional[Dict[str, float]] = None) -> Dict:
         """Intention-based decision using multi-criteria weighted scoring with severity prioritization and budget awareness."""
         weights = {m: 0.0 for m in ["latency", "cpu_usage", "ram_usage"]}
         for s in slos: weights[s["metric"]] = s.get("weight", 0.0)
@@ -1372,7 +1664,11 @@ class DecisionIntelligenceSpoke:
             
             final_pool = valid if valid else targets
             # Use TOPSIS selection
-            best = self._topsis_select(final_pool, predictions_map, slos, weights, migration_costs=migration_costs)
+            best = self._topsis_select(
+                final_pool, predictions_map, slos, weights, 
+                migration_costs=migration_costs,
+                reliability_scores=reliability_scores
+            )
             
             breach_info = worst.get("breach_type", "reactive")
             ttb = worst.get("time_to_breach", 0)
@@ -1417,17 +1713,23 @@ class DatabaseSpoke:
                 conn.execute("ALTER TABLE decisions ADD COLUMN budget_remaining REAL")
             except sqlite3.OperationalError:
                 pass # Colonne déjà existante
-            
+
             # Migration douce pour is_violation
             try:
                 conn.execute("ALTER TABLE metrics ADD COLUMN is_violation INTEGER DEFAULT 0")
             except sqlite3.OperationalError:
                 pass # Colonne déjà existante
 
+            # Migration douce pour data_source
+            try:
+                conn.execute("ALTER TABLE metrics ADD COLUMN data_source TEXT DEFAULT 'unknown'")
+            except sqlite3.OperationalError:
+                pass # Colonne déjà existante
+
     @safe_call(None, "DatabaseSpoke.save_metrics")
     def save_metrics(self, measurements: List[Dict], mode: str, slos: List[Dict] = []):
         """Saves a batch of VM metrics to SQLite, identifying violations in real-time.
-        
+
         Args:
             measurements: List of metric dictionaries.
             mode: The orchestrator mode (classic/enhanced).
@@ -1443,12 +1745,22 @@ class DatabaseSpoke:
                     if val is not None and val > slo["threshold"]:
                         is_violation = 1
                         break
-                
+
                 conn.execute(
-                    "INSERT INTO metrics (vm_id, rtt_ms, cpu_usage, ram_usage, mode, is_violation, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)", 
-                    (m["vm_id"], m.get("rtt_ms", 0), m.get("cpu_usage", 0), m.get("ram_usage", 0), mode, is_violation, ts)
+                    "INSERT INTO metrics (vm_id, rtt_ms, cpu_usage, ram_usage, mode, is_violation, data_source, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (m["vm_id"], m.get("rtt_ms", 0), m.get("cpu_usage", 0), m.get("ram_usage", 0), mode, is_violation, m.get("data_source", "unknown"), ts)
                 )
 
+    @safe_call(1.0, "DatabaseSpoke.get_data_quality_ratio")
+    def get_data_quality_ratio(self, window_seconds: int = 300) -> float:
+        """Ratio real/(real+simulated) sur la fenêtre. Retourne 1.0 si vide."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=window_seconds)).isoformat()
+        with sqlite3.connect(self.config.DB_NAME) as conn:
+            total = conn.execute("SELECT COUNT(*) FROM metrics WHERE timestamp > ?", (cutoff,)).fetchone()[0]
+            if total == 0:
+                return 1.0
+            real = conn.execute("SELECT COUNT(*) FROM metrics WHERE data_source='real' AND timestamp > ?", (cutoff,)).fetchone()[0]
+            return round(real / total, 4)
     @safe_call(False, "DatabaseSpoke.save_decision")
     def save_decision(self, dec: Dict, mode: str, ack: bool):
         ts = datetime.now(timezone.utc).isoformat()
@@ -1633,22 +1945,122 @@ class ObservabilitySpoke:
         self.max_points = 50
         self.current_service_vm = None  # VM qui héberge le service
         self.last_decision = {"decision": "stay", "reason": ""}
+        self.last_decision_detail: Dict = {
+            "decision": "stay",
+            "from_vm": None,
+            "to_vm": None,
+            "reason": "",
+            "topsis_score": 0.0,
+            "breach_type": "none",
+            "uncertainty": 0.0
+        }
+        self.mi_scores_history: List[Dict[str, float]] = []
+        self.max_mi_points: int = 50
+        self.violation_timeline: List[Dict] = []
+        self.max_timeline_points: int = 100
+        self.data_quality: float = 1.0
 
-    def update_decision(self, dec: Dict, current_vm: str = None):
-        self.last_decision = dec
+    def update_mi_scores(self, scores: Dict[str, float]) -> None:
+        """Reçoit les MI scores du Hub et maintient l'historique FIFO.
+        
+        Args:
+            scores: Dict métrique → score MI [0.0, 1.0]
+        """
+        try:
+            if not isinstance(scores, dict) or not scores:
+                logger.warning("[Observability] Reçu MI scores vides ou invalides.")
+                return
+
+            self.mi_scores_history.append(scores)
+            if len(self.mi_scores_history) > self.max_mi_points:
+                self.mi_scores_history.pop(0)
+        except Exception as e:
+            logger.error(f"[Observability] Erreur update_mi_scores: {e}")
+
+    def _extract_breach_type(self, dec: Dict) -> str:
+        """Détermine le type de violation à partir de la décision."""
+        try:
+            # Priorité 1 : explicite
+            if "breach_type" in dec:
+                return dec["breach_type"]
+            
+            # Priorité 2 : inférence par le texte
+            reason = dec.get("reason", "").lower()
+            if "prédit" in reason:
+                return "proactive"
+            if ">" in reason:
+                return "reactive"
+            
+            return "none"
+        except Exception:
+            return "none"
+
+    def update_quality(self, ratio: float) -> None:
+        """Reçoit data_quality_ratio depuis OrchestratorCore."""
+        try:
+            self.data_quality = max(0.0, min(1.0, float(ratio)))
+        except (ValueError, TypeError):
+            self.data_quality = 1.0
+
+    def update_decision(self, dec: Dict, current_vm: str = None) -> None:
+        """Met à jour les informations de la dernière décision prise."""
+        self.last_decision = dec  # Rétrocompatibilité
+        self.last_decision_detail = {
+            "decision":     dec.get("decision", "stay"),
+            "from_vm":      dec.get("from_vm"),
+            "to_vm":        dec.get("to_vm"),
+            "reason":       dec.get("reason", ""),
+            "topsis_score": float(dec.get("topsis_score", 0.0)),
+            "breach_type":  self._extract_breach_type(dec),
+            "uncertainty":  float(dec.get("uncertainty", 0.0))
+        }
+        
+        if dec.get("decision") == "migrate":
+            event = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "type": "migration",
+                "vm": dec.get("from_vm", ""),
+                "metric": f"{dec.get('from_vm','')}→{dec.get('to_vm','')}"
+            }
+            self.violation_timeline.append(event)
+            if len(self.violation_timeline) > self.max_timeline_points:
+                self.violation_timeline.pop(0)
 
     def update_data(self, current_data: List[Dict]):
-        # Découverte dynamique de la VM active
-        active_vm = next((e["vm_id"] for e in current_data if e.get("is_active_service")), None)
-        if active_vm:
-            self.current_service_vm = active_vm
+        """Met à jour l'historique avec les dernières mesures reçues et détecte les violations."""
+        try:
+            ts = datetime.now(timezone.utc).isoformat()
+            active_vm = next((e["vm_id"] for e in current_data if e.get("is_active_service")), None)
+            if active_vm:
+                self.current_service_vm = active_vm
 
-        for entry in current_data:
-            vm = entry["vm_id"]
-            for key, m in [("rtt", "rtt_ms"), ("cpu", "cpu_usage"), ("ram", "ram_usage")]:
-                if m in entry:
-                    self.history[key][vm].append(entry[m])
-                    if len(self.history[key][vm]) > self.max_points: self.history[key][vm].pop(0)
+            for entry in current_data:
+                vm = entry["vm_id"]
+                for key, m in [("rtt", "rtt_ms"), ("cpu", "cpu_usage"), ("ram", "ram_usage")]:
+                    if m in entry:
+                        self.history[key][vm].append(entry[m])
+                        if len(self.history[key][vm]) > self.max_points: 
+                            self.history[key][vm].pop(0)
+                
+                # Détection locale de violations SLO
+                for slo in self.current_slos:
+                    col = "rtt_ms" if slo["metric"] == "latency" else slo["metric"]
+                    val = entry.get(col)
+                    if val is not None and val > slo["threshold"]:
+                        event = {
+                            "ts": ts,
+                            "type": "violation",
+                            "vm": vm,
+                            "metric": slo["metric"]
+                        }
+                        self.violation_timeline.append(event)
+
+            # Tronquer la timeline
+            if len(self.violation_timeline) > self.max_timeline_points:
+                self.violation_timeline = self.violation_timeline[-self.max_timeline_points:]
+
+        except Exception as e:
+            logger.warning(f"[Observability] Erreur update_data: {e}")
 
     def update_predictions(self, preds_map: Dict, mode: str = "classic"):
         if mode == "classic":
@@ -1666,9 +2078,60 @@ class ObservabilitySpoke:
                 if len(self.predictions_history[m_key][vm]) > self.max_points:
                     self.predictions_history[m_key][vm].pop(0)
 
+    def _build_suptitle(self) -> tuple[str, str]:
+        """Construit le titre multi-ligne enrichi pour le dashboard."""
+        d = self.last_decision_detail
+        is_migrate = d.get("decision") == "migrate"
+        color = "red" if is_migrate else "green"
+
+        # Line 1 : Décision principale
+        if is_migrate:
+            line1 = (f"MIGRATE {d.get('from_vm')}→{d.get('to_vm')} | "
+                     f"TOPSIS:{d.get('topsis_score', 0.0):.3f} | "
+                     f"{str(d.get('breach_type', 'none')).upper()} | "
+                     f"Incert:{d.get('uncertainty', 0.0):.2f}")
+        else:
+            line1 = f"STAY | {d.get('reason', 'Nominal')}"
+
+        # Line 2 : Contexte ML + Qualité
+        dq = self.data_quality
+        if self.mi_scores_history:
+            m = self.mi_scores_history[-1]
+            line2 = (f"MI: cpu={m.get('cpu_usage', 0.0):.2f} "
+                     f"ram={m.get('ram_usage', 0.0):.2f} "
+                     f"lat={m.get('latency', 0.0):.2f} | "
+                     f"DataQuality: {dq:.1%}")
+        else:
+            line2 = f"MI: N/A | DataQuality: {dq:.1%}"
+
+        # Line 3 : Timeline compacte (2 derniers événements)
+        line3 = ""
+        if self.violation_timeline:
+            events = self.violation_timeline[-2:]
+            parts = []
+            for ev in events:
+                try:
+                    dt = datetime.fromisoformat(ev["ts"])
+                    time_str = dt.strftime("%H:%M")
+                except Exception:
+                    time_str = "??"
+                
+                type_abbr = "VIO" if ev["type"] == "violation" else "MIG"
+                if ev["type"] == "violation":
+                    parts.append(f"[{time_str}] {type_abbr} {ev['metric']} {ev['vm']}")
+                else:
+                    parts.append(f"[{time_str}] {type_abbr} {ev['metric']}")
+            line3 = " | ".join(parts)
+
+        full_title = f"{line1}\n{line2}"
+        if line3:
+            full_title += f"\n{line3}"
+            
+        return full_title, color
+
     def start_gui(self):
         plt.ion(); fig = plt.figure(figsize=(20, 15))
-        axs = fig.subplots(3, 4)
+        axs = fig.subplots(4, 4)
         while True:
             for r_idx, (m_key, m_name) in enumerate([("rtt", "latency"), ("cpu", "cpu_usage"), ("ram", "ram_usage")]):
                 for c_idx, vm in enumerate(self.config.VM_LIST):
@@ -1692,18 +2155,31 @@ class ObservabilitySpoke:
                         
                     ax.set_ylim(0, 100); ax.legend(loc="upper right")
             
-            dec = self.last_decision
-            if dec["decision"] == "migrate":
-                title = (f"🔴 DÉCISION : MIGRATE "
-                         f"{dec.get('from_vm', '?')} → {dec.get('to_vm', '?')}"
-                         f"  |  {dec.get('reason', '')}")
-                color = "red"
-            else:
-                title = f"🟢 DÉCISION : STAY  |  {dec.get('reason', 'Nominal')}"
-                color = "green"
+            # --- Panel MI Score Evolution ---
+            ax_mi = axs[3, 0]
+            ax_mi.clear()
+            mi_metrics = ["latency", "cpu_usage", "ram_usage"]
+            colors = {"latency": "blue", "cpu_usage": "orange", "ram_usage": "green"}
+            
+            for m in mi_metrics:
+                series = [s.get(m, 0.0) for s in self.mi_scores_history]
+                ax_mi.plot(series, label=m, color=colors[m])
+            
+            ax_mi.axhline(y=0.05, color="red", linestyle="--", linewidth=0.8, label="Seuil MI=0.05")
+            ax_mi.set_ylim(0.0, 1.0)
+            ax_mi.set_title("MI Score Evolution", fontweight="bold")
+            ax_mi.set_ylabel("MI Score")
+            ax_mi.legend(loc="upper right", fontsize=7)
 
-            fig.suptitle(title, fontsize=11, color=color, 
-                         fontweight="bold", y=0.02)
+            # Masquer les cellules vides de la dernière ligne
+            for c in range(1, 4):
+                axs[3, c].set_visible(False)
+
+            # Mise à jour du titre enrichi
+            full_title, color = self._build_suptitle()
+            fig.suptitle(full_title, fontsize=9, color=color,
+                         fontweight="bold", y=0.01,
+                         verticalalignment="bottom")
             
             plt.tight_layout(); plt.pause(1)
 
@@ -1778,8 +2254,13 @@ class OrchestratorCore:
                 "uptime": int(time.time() - self.start_ts), 
                 "slos": self.current_slos,
                 "service_vm": self._last_known_active_vm,
-                "mi_scores": self.last_mi_scores
+                "mi_scores": self.last_mi_scores,
+                "data_quality": self.db.get_data_quality_ratio()
             }), 200
+
+    def get_reliability_scores(self) -> Dict[str, float]:
+        """Retourne reliability EMA par VM depuis CollectorSpoke."""
+        return dict(self.collector.reliability_ema)
 
     def _find_active_vm(self, enriched: List[Dict]) -> Optional[str]:
         """Retourne le vm_id de la VM active dans le payload courant."""
@@ -1907,8 +2388,25 @@ class OrchestratorCore:
                     slo["budget_remaining"] = 100.0
 
     def run_classic_flow(self, measurements: List[Dict]) -> Dict:
-        """Executes the standard 7-step network-centric migration flow. (DEPRECATED)"""
-        logger.warning("[Core] run_classic_flow() est déprécié. Utiliser run_autonomous_flow() à la place.")
+        """Executes the standard 7-step network-centric migration flow.
+        
+        ⚠️ DEPRECATED: This method is deprecated and no longer part of the LatencyHandler
+        contract. Use run_autonomous_flow() instead, which provides all use cases with
+        RTT + CPU + RAM + Mutual Information (MI) metric selection.
+        
+        This method is preserved for historical compatibility only and will not be
+        called by any spoke in normal operation.
+        
+        Args:
+            measurements: List of RTT measurements with vm_id and rtt_ms.
+            
+        Returns:
+            Decision dict with keys: decision, from_vm, to_vm, reason, mode.
+        """
+        logger.warning(
+            "[Core] run_classic_flow() est déprécié. "
+            "Utiliser run_autonomous_flow() à la place."
+        )
         self._print_cycle_header()
         
         # Découverte dynamique du service
@@ -1952,11 +2450,12 @@ class OrchestratorCore:
 
         with self._lock:
             self.last_mi_scores = mi_scores
+            self.viz.update_mi_scores(mi_scores)
         
         # 2. Collect Metrics
         log_step("2. COLLECTION REQUEST", "MetricsManager -> Collector", needed)
         enriched = [
-            {**rm, **self._filter_active_metrics(self.collector.collect_vm_metrics(rm["vm_id"]), active, rm["vm_id"])} 
+            {**rm, **self._filter_active_metrics(self.collector.collect_vm_metrics(rm["vm_id"], history_loader=self.history), active, rm["vm_id"])} 
             for rm in measurements
         ]
         
@@ -2005,8 +2504,13 @@ class OrchestratorCore:
         # 6. Decision logic
         log_step("6. DECISION REQUEST", "Core -> DecisionIntelligence", self.current_slos)
         cooldown = self._check_cooldown()
+        
+        reliability_scores = self.get_reliability_scores()
+        
         dec = cooldown if cooldown else self.decision_engine.evaluate_enhanced_decision(
-            enriched, preds_map, self.current_slos, service_vm, migration_costs=migration_costs
+            enriched, preds_map, self.current_slos, service_vm, 
+            migration_costs=migration_costs,
+            reliability_scores=reliability_scores
         )
         
         # 7. Update Observability
@@ -2028,10 +2532,11 @@ class OrchestratorCore:
 
         with self._lock:
             self.last_mi_scores = mi_scores
+            self.viz.update_mi_scores(mi_scores)
         
         # 2-3. Collect & Store
         log_step("2. COLLECTION REQUEST", "MetricsManager -> Collector", needed)
-        enriched = [{**rm, **self._filter_active_metrics(self.collector.collect_vm_metrics(rm["vm_id"]), active, rm["vm_id"])} for rm in rtt_measurements]
+        enriched = [{**rm, **self._filter_active_metrics(self.collector.collect_vm_metrics(rm["vm_id"], history_loader=self.history), active, rm["vm_id"])} for rm in rtt_measurements]
         
         # 3. Découverte dynamique du service
         service_vm = self._find_active_vm(enriched)
@@ -2079,7 +2584,14 @@ class OrchestratorCore:
         
         # Decision step with Cooldown
         cooldown = self._check_cooldown()
-        dec = cooldown if cooldown else self.decision_engine.evaluate_enhanced_decision(enriched, preds_map, self.current_slos, service_vm, migration_costs=migration_costs)
+        
+        reliability_scores = self.get_reliability_scores()
+        
+        dec = cooldown if cooldown else self.decision_engine.evaluate_enhanced_decision(
+            enriched, preds_map, self.current_slos, service_vm, 
+            migration_costs=migration_costs,
+            reliability_scores=reliability_scores
+        )
         
         log_step("8. RETOUR DÉCISION", "DecisionIntelligence -> Core", dec)
         self.viz.update_data(enriched)
@@ -2099,6 +2611,9 @@ class OrchestratorCore:
 
         ack = self._send_to_master(dec, mode)
         self.db.save_decision(dec, mode, ack)
+        
+        ratio = self.db.get_data_quality_ratio()
+        self.viz.update_quality(ratio)
         
         if dec["decision"] == "stay":
             self.viz.update_decision(dec)
