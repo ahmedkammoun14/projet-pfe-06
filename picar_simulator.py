@@ -9,6 +9,10 @@ import httpx
 VM_PORTS = {"vm1": 8101, "vm2": 8102, "vm3": 8103, "vm4": 8104}
 LATENCY_MANAGER_URL = "http://localhost:8010/rtt"
 INTERVAL_SECONDS = 5
+# Retry / startup tuning to handle race with Flask startup
+MAX_RETRIES = 3
+RETRY_DELAY = 2.0  # seconds between retries when posting
+INITIAL_DELAY = 3.0  # initial wait to let Flask apps start
 
 # Configuration du logging
 logging.basicConfig(
@@ -54,18 +58,31 @@ async def run_cycle(client: httpx.AsyncClient, cycle_num: int):
         "measurements": measurements
     }
 
-    # 4. Envoi au Latency Manager
-    try:
-        resp = await client.post(LATENCY_MANAGER_URL, json=payload, timeout=5.0)
-        resp.raise_for_status()
-        logger.info(f"[PICAR] Envoi → POST {LATENCY_MANAGER_URL} → status {resp.status_code}")
-    except (httpx.ConnectError, httpx.HTTPStatusError, httpx.TimeoutException):
-        logger.error(f"[PICAR] Erreur envoi (Latency Manager indisponible) → retry au prochain cycle")
+    # 4. Envoi au Latency Manager avec retry/backoff
+    sent = False
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = await client.post(LATENCY_MANAGER_URL, json=payload, timeout=5.0)
+            resp.raise_for_status()
+            logger.info(f"[PICAR] Envoi → POST {LATENCY_MANAGER_URL} → status {resp.status_code}")
+            sent = True
+            break
+        except (httpx.ConnectError, httpx.HTTPStatusError, httpx.TimeoutException) as e:
+            if attempt < MAX_RETRIES - 1:
+                logger.warning(f"[PICAR] Envoi échoué (attempt {attempt+1}/{MAX_RETRIES}): {e} — retry dans {RETRY_DELAY}s")
+                await asyncio.sleep(RETRY_DELAY)
+            else:
+                logger.error(f"[PICAR] Erreur envoi (Latency Manager indisponible) après {MAX_RETRIES} tentatives")
+    # sent indique si l'envoi a réussi au moins une fois
 
 async def main():
     """Boucle principale du simulateur PiCar."""
     logger.info("Démarrage du simulateur PiCar (RTT Reporter)...")
     
+    # Laisser le temps aux services Flask (LatencyManager, VMs) de démarrer
+    logger.info(f"[PICAR] Attente initiale de {INITIAL_DELAY}s pour les services")
+    await asyncio.sleep(INITIAL_DELAY)
+
     async with httpx.AsyncClient() as client:
         cycle = 1
         while True:
