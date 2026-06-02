@@ -275,25 +275,33 @@ class IntentManagerSpoke:
         )
 
     def _detect_refinement_mode(self, text: str, current_slos: List[Dict], detected_metrics: List[str]) -> str:
-        """Détecte si la nouvelle intention doit REMPLACER ou S'AJOUTER aux SLOs actuels."""
+        """Détecte si la nouvelle intention doit REMPLACER, S'AJOUTER ou RAFFINER les SLOs actuels."""
         if not current_slos:
             return "REPLACE"
 
         normalized = self._normalize(text)
 
-        # Priorité 1 : Mots-clés de raffinement explicites
+        # PRIORITÉ 1 — REFINE
+        # Détecté si : mot-clé STRICT + métrique mentionnée + SLOs existants
+        strict_kws = [self._normalize(k) for k in self.STRICT_MORE + self.STRICT_LESS]
+        all_metrics_kws = []
+        for kws in self.METRIC_KEYWORDS.values():
+            all_metrics_kws.extend([self._normalize(k) for k in kws])
+            
+        if any(kw in normalized for kw in strict_kws) and any(kw in normalized for kw in all_metrics_kws):
+            return "REFINE"
+
+        # PRIORITÉ 2 — ADDITIVE
+        # Détecté si : mot-clé de REFINE_KEYWORDS présent OU aucun chevauchement de métriques
         if any(kw in normalized for kw in self.REFINE_KEYWORDS):
             return "ADDITIVE"
 
-        # Priorité 2 : Complémentarité sémantique
         current_metrics = set(s["metric"] for s in current_slos)
         new_metrics = set(detected_metrics)
-
-        # Si aucune métrique détectée ne chevauche l'existant -> ADDITIVE
         if not (current_metrics & new_metrics):
             return "ADDITIVE"
 
-        # Chevauchement trouvé -> REPLACE (on remplace l'existant)
+        # PRIORITÉ 3 — REPLACE (par défaut)
         return "REPLACE"
 
     class _SLOCoherenceValidator:
@@ -1654,6 +1662,16 @@ class DecisionIntelligenceSpoke:
         Returns:
             Dictionary with breach status, time_to_breach, slope, and type.
         """
+        if not preds:
+            breach_reactive = current_val > threshold
+            return {
+                "breach_reactive": breach_reactive,
+                "breach_proactive": False,
+                "time_to_breach": len(preds) + 1,
+                "slope": 0.0,
+                "breach_type": "reactive" if breach_reactive else "none"
+            }
+
         # Breach réactif (inchangé)
         breach_reactive = current_val > threshold
 
@@ -1796,6 +1814,10 @@ class DecisionIntelligenceSpoke:
                 reliability_scores=reliability_scores
             )
             
+            if not best or "vm_id" not in best:
+                logger.warning("Aucune cible disponible pour migration")
+                return {"decision": "stay", "reason": "Aucune cible disponible pour migration"}
+
             breach_info = worst.get("breach_type", "reactive")
             ttb = worst.get("time_to_breach", 0)
             
@@ -2482,15 +2504,26 @@ class OrchestratorCore:
         return None
 
     def _filter_active_metrics(self, collected: Dict, active_metrics: List[str], fallback_vm_id: str) -> Dict:
+        """
+        Filters collected VM metrics to keep only those requested by the MetricsManager,
+        while ensuring essential metadata (is_active_service, data_source, reliability) 
+        is propagated for downstream decision-making and observability.
+        """
         if not collected or "vm_id" not in collected:
             return {"vm_id": fallback_vm_id}
+        
         res = {"vm_id": collected["vm_id"]}
         for m in ["cpu_usage", "ram_usage"]:
             if m in active_metrics and m in collected:
                 res[m] = collected[m]
-        # Propager is_active_service pour que _find_active_vm() fonctionne
+        
+        # Propager metadata essentiels
         if "is_active_service" in collected:
             res["is_active_service"] = collected["is_active_service"]
+            
+        res["data_source"] = collected.get("data_source", "unknown")
+        res["reliability"] = collected.get("reliability", 1.0)
+        
         return res
 
     def _refresh_slo_budgets(self):

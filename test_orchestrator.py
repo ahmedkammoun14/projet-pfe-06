@@ -2403,6 +2403,103 @@ class TestSLOMerge:
         assert result[1]["weight"] == 0.5
 
 # =============================================================================
+# VALIDATION DES CORRECTIFS (BUGS 1 & 2)
+# =============================================================================
+
+class TestBugFixes(unittest.TestCase):
+    def setUp(self):
+        self.config = Config()
+        self.decision_spoke = DecisionIntelligenceSpoke(self.config)
+        
+        # Mock du Hub pour IntentManagerSpoke
+        self.mock_hub = MagicMock()
+        # Initialisation de IntentManagerSpoke avec des paramètres factices
+        self.intent_spoke = IntentManagerSpoke(
+            config=self.config,
+            core=self.mock_hub,
+            db_path=":memory:",
+            current_slos=[]
+        )
+
+    # --- TESTS BUG 1 : DecisionIntelligenceSpoke._analyze_predictions ---
+
+    def test_bug1_preds_empty_low_val(self):
+        """Test 1 : preds=[] + current_val sous 70% du seuil -> breach_type='none'"""
+        threshold = 100.0
+        current_val = 60.0 # 60% < 70%
+        result = self.decision_spoke._analyze_predictions(
+            preds=[], 
+            threshold=threshold, 
+            current_val=current_val
+        )
+        self.assertEqual(result["breach_type"], "none")
+        self.assertFalse(result["breach_proactive"])
+
+    def test_bug1_preds_empty_high_val(self):
+        """Test 2 : preds=[] + current_val au-dessus de 70% du seuil -> breach_type='none' (Correction BUG 1)"""
+        threshold = 100.0
+        current_val = 80.0 # 80% > 70%
+        result = self.decision_spoke._analyze_predictions(
+            preds=[], 
+            threshold=threshold, 
+            current_val=current_val
+        )
+        # Avant correction, time_to_breach=1 et cond3=True provoquaient un breach proactif
+        self.assertEqual(result["breach_type"], "none")
+        self.assertFalse(result["breach_proactive"])
+
+    def test_bug1_preds_empty_reactive_breach(self):
+        """Test 3 : preds=[] + current_val > seuil -> breach_type='reactive'"""
+        threshold = 100.0
+        current_val = 110.0
+        result = self.decision_spoke._analyze_predictions(
+            preds=[], 
+            threshold=threshold, 
+            current_val=current_val
+        )
+        self.assertEqual(result["breach_type"], "reactive")
+        self.assertTrue(result["breach_reactive"])
+        self.assertFalse(result["breach_proactive"])
+
+    # --- TESTS BUG 2 : IntentManagerSpoke._detect_refinement_mode ---
+
+    def test_bug2_refine_strict_more(self):
+        """Test 4 : 'plus strict sur la latence' + slos existants -> 'REFINE'"""
+        text = "plus strict sur la latence"
+        current_slos = [{"metric": "latency", "threshold": 50.0}]
+        detected_metrics = ["latency"]
+        
+        mode = self.intent_spoke._detect_refinement_mode(text, current_slos, detected_metrics)
+        self.assertEqual(mode, "REFINE")
+
+    def test_bug2_refine_strict_less(self):
+        """Test 5 : 'relâche le cpu' + slos existants -> 'REFINE'"""
+        text = "relâche le cpu"
+        current_slos = [{"metric": "cpu_usage", "threshold": 75.0}]
+        detected_metrics = ["cpu_usage"]
+        
+        mode = self.intent_spoke._detect_refinement_mode(text, current_slos, detected_metrics)
+        self.assertEqual(mode, "REFINE")
+
+    def test_bug2_additive_keyword(self):
+        """Test 6 : 'aussi la RAM' + slos existants -> 'ADDITIVE'"""
+        text = "aussi la RAM"
+        current_slos = [{"metric": "latency", "threshold": 50.0}]
+        detected_metrics = ["ram_usage"]
+        
+        mode = self.intent_spoke._detect_refinement_mode(text, current_slos, detected_metrics)
+        self.assertEqual(mode, "ADDITIVE")
+
+    def test_bug2_replace_no_existing_slos(self):
+        """Test 7 : intention sans slos existants -> 'REPLACE'"""
+        text = "je veux éviter les ralentissements"
+        current_slos = []
+        detected_metrics = ["latency"]
+        
+        mode = self.intent_spoke._detect_refinement_mode(text, current_slos, detected_metrics)
+        self.assertEqual(mode, "REPLACE")
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
